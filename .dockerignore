@@ -1,0 +1,15 @@
+.git
+.gitignore
+.DS_Store
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.superpowers
+docs
+tests
+web
+node_modules
+dist
+*.log
