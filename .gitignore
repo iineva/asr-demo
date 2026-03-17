@@ -20,6 +20,8 @@ uploads/*
 !uploads/.gitkeep
 outputs/*
 !outputs/.gitkeep
+model-cache/*
+!model-cache/.gitkeep
 
 # Logs
 *.log

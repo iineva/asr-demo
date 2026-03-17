@@ -10,6 +10,9 @@ services:
       SERVICE_NAME: asr-service
       UPLOAD_DIR: /app/uploads
       OUTPUT_DIR: /app/outputs
+      XDG_CACHE_HOME: /app/model-cache
+      HF_HOME: /app/model-cache/huggingface
+      TRANSFORMERS_CACHE: /app/model-cache/transformers
       MAX_UPLOAD_SIZE_MB: 100
       FFMPEG_TIMEOUT_SECONDS: 300
       TRANSCRIBE_TIMEOUT_SECONDS: 1800
@@ -21,6 +24,7 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
+      - ./model-cache:/app/model-cache
     restart: unless-stopped
   asr-web:
     build:
