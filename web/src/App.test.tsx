@@ -69,4 +69,24 @@ describe("App", () => {
     await waitFor(() => expect(mockTranscribe).not.toHaveBeenCalled());
     expect(session.cancel).toHaveBeenCalledTimes(1);
   });
+
+  it("uploads a selected audio file and renders the transcription result", async () => {
+    const mockTranscribe = vi.fn().mockResolvedValue({
+      requested_language: "auto",
+      detected_language: "my",
+      language_probability: 0.99,
+      text: "မင်္ဂလာပါ",
+      segments: [{ start: 0, end: 1.5, text: "မင်္ဂလာပါ" }],
+    });
+
+    render(<App transcribeAudio={mockTranscribe} />);
+
+    const input = screen.getByLabelText(/上传音频文件/i) as HTMLInputElement;
+    const file = new File(["audio"], "sample.webm", { type: "audio/webm" });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    await waitFor(() => expect(mockTranscribe).toHaveBeenCalledWith(file, "auto"));
+    expect(await screen.findByText(/识别语言 my/i)).toBeInTheDocument();
+    expect((await screen.findAllByText("မင်္ဂလာပါ")).length).toBeGreaterThan(0);
+  });
 });

@@ -47,6 +47,7 @@ export default function App({
   const sessionRef = useRef<RecorderSession | null>(null);
   const timerRef = useRef<number | null>(null);
   const startedAtRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     return () => {
@@ -70,11 +71,25 @@ export default function App({
     setDurationMs(0);
   };
 
+  const runTranscription = async (source: Blob | File, uploadErrorMessage: string) => {
+    try {
+      setError("");
+      setStatus("uploading");
+      const nextResult = await transcribeAudio(source, language);
+      setResult(nextResult);
+      setStatus("success");
+    } catch (uploadError) {
+      setStatus("error");
+      setError(uploadError instanceof Error ? uploadError.message : uploadErrorMessage);
+    }
+  };
+
   const handlePointerDown = async (event: React.PointerEvent<HTMLButtonElement>) => {
     if (status === "requesting" || status === "uploading") {
       return;
     }
 
+    event.preventDefault();
     if ("setPointerCapture" in event.currentTarget) {
       event.currentTarget.setPointerCapture(event.pointerId);
     }
@@ -127,11 +142,8 @@ export default function App({
     }
 
     try {
-      setStatus("uploading");
       const blob = await session.stop();
-      const nextResult = await transcribeAudio(blob, language);
-      setResult(nextResult);
-      setStatus("success");
+      await runTranscription(blob, "录音上传失败");
     } catch (uploadError) {
       setStatus("error");
       setError(uploadError instanceof Error ? uploadError.message : "录音上传失败");
@@ -148,6 +160,22 @@ export default function App({
   const handlePointerCancel = async () => {
     setStatus("cancel");
     await finishRecording(true);
+  };
+
+  const handleUploadButtonClick = () => {
+    if (status === "requesting" || status === "recording" || status === "cancel" || status === "uploading") {
+      return;
+    }
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    await runTranscription(file, "文件上传失败");
+    event.target.value = "";
   };
 
   return (
@@ -195,6 +223,24 @@ export default function App({
             <span className="record-button-title">按住说话</span>
             <span className="record-button-subtitle">Hold to record</span>
           </span>
+        </button>
+
+        <input
+          ref={fileInputRef}
+          id="audio-upload"
+          className="file-input"
+          type="file"
+          aria-label="上传音频文件"
+          accept=".m4a,.mp3,.wav,.webm,audio/*"
+          onChange={handleFileChange}
+        />
+        <button
+          type="button"
+          className="upload-button"
+          onClick={handleUploadButtonClick}
+          disabled={status === "requesting" || status === "recording" || status === "cancel" || status === "uploading"}
+        >
+          上传音频文件
         </button>
 
         {error ? <p className="inline-error">{error}</p> : null}

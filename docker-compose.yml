@@ -22,13 +22,6 @@ services:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
   asr-web:
     build:
       context: ./web

@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 
 class UtilsContractTests(unittest.TestCase):
@@ -19,6 +20,10 @@ class UtilsContractTests(unittest.TestCase):
         from app.utils import normalize_text
 
         self.assertEqual(normalize_text("  hello   world \n "), "hello world")
+
+    def test_requirements_include_requests_for_faster_whisper_runtime(self) -> None:
+        requirements = Path("requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("requests", requirements)
 
 
 if __name__ == "__main__":

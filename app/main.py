@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 import json
 import logging
 import os
@@ -27,6 +28,13 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        if record.exc_info and isinstance(record.exc_info, tuple):
+            exc_type, exc_value, exc_traceback = record.exc_info
+            payload["exception"] = {
+                "type": exc_type.__name__ if exc_type else None,
+                "message": str(exc_value) if exc_value else "",
+                "traceback": "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)),
+            }
         return json.dumps(payload, ensure_ascii=False)
 
 
