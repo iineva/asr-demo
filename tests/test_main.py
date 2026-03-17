@@ -26,7 +26,7 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/transcribe",
+                "/api/transcribe",
                 files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
                 data={"language": "zh"},
             )
@@ -40,7 +40,7 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.options(
-                "/transcribe",
+                "/api/transcribe",
                 headers={
                     "Origin": "http://localhost:5173",
                     "Access-Control-Request-Method": "POST",
@@ -78,7 +78,7 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
                     response = await client.post(
-                        "/transcribe",
+                        "/api/transcribe",
                         files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
                         data={"language": "yue"},
                         headers={"Origin": "http://localhost:5173"},
@@ -114,7 +114,7 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
                     response = await client.post(
-                        "/transcribe",
+                        "/api/transcribe",
                         files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
                         data={"language": "yue"},
                     )
@@ -143,7 +143,7 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
                     response = await client.post(
-                        "/transcribe",
+                        "/api/transcribe",
                         files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
                         data={"language": "auto"},
                     )

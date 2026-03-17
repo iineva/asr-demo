@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -88,13 +88,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+api_router = APIRouter(prefix="/api")
 
-@app.get("/health")
+
+@api_router.get("/health")
 async def health() -> Dict[str, Any]:
     return {"success": True, "status": "ok"}
 
 
-@app.get("/ready")
+@api_router.get("/ready")
 async def ready() -> JSONResponse:
     try:
         await asyncio.to_thread(get_transcriber)
@@ -103,7 +105,7 @@ async def ready() -> JSONResponse:
     return JSONResponse(status_code=200, content={"success": True, "status": "ready"})
 
 
-@app.post("/transcribe")
+@api_router.post("/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto")) -> Dict[str, Any]:
     settings = get_settings()
     try:
@@ -140,3 +142,6 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
         remove_file_safely(source_path)
 
     return {"success": True, "result": result}
+
+
+app.include_router(api_router)
