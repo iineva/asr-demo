@@ -1,0 +1,6 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+faster-whisper==1.2.0
+torch==2.8.0
+ffmpeg-python==0.2.0
+python-multipart==0.0.20

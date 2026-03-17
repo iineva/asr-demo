@@ -1,0 +1,41 @@
+services:
+  asr-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: asr-service
+    ports:
+      - "8000:8000"
+    environment:
+      SERVICE_NAME: asr-service
+      UPLOAD_DIR: /app/uploads
+      OUTPUT_DIR: /app/outputs
+      MAX_UPLOAD_SIZE_MB: 100
+      FFMPEG_TIMEOUT_SECONDS: 300
+      TRANSCRIBE_TIMEOUT_SECONDS: 1800
+      PRELOAD_MODEL_ON_STARTUP: "false"
+      WHISPER_MODEL_SIZE: large-v3
+      WHISPER_DEVICE: auto
+      WHISPER_COMPUTE_TYPE_CUDA: float16
+      WHISPER_COMPUTE_TYPE_CPU: int8
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  asr-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: asr-web
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+    depends_on:
+      - asr-service
