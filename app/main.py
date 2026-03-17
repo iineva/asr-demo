@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.asr import get_transcriber, transcribe_audio
 from app.utils import (
@@ -79,6 +80,13 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="ASR Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")

@@ -33,6 +33,60 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    async def test_cors_preflight_allows_any_origin_by_default(self) -> None:
+        from app.main import app
+        from httpx import ASGITransport, AsyncClient
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.options(
+                "/transcribe",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
+        self.assertIn("POST", response.headers.get("access-control-allow-methods", ""))
+
+    async def test_cors_actual_response_uses_wildcard_origin_by_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "UPLOAD_DIR": self.upload_dir,
+                "OUTPUT_DIR": self.output_dir,
+                "MAX_UPLOAD_SIZE_MB": "5",
+            },
+            clear=False,
+        ):
+            from app.main import app
+            from httpx import ASGITransport, AsyncClient
+
+            mocked_result = {
+                "requested_language": "yue",
+                "detected_language": "yue",
+                "language_probability": 0.97,
+                "text": "hello world",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "hello world"}],
+            }
+
+            with patch("app.main.convert_audio_to_wav", new=AsyncMock(return_value="/tmp/audio.wav")), patch(
+                "app.main.transcribe_audio", new=AsyncMock(return_value=mocked_result)
+            ):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as client:
+                    response = await client.post(
+                        "/transcribe",
+                        files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
+                        data={"language": "yue"},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
+
     async def test_transcribe_returns_expected_payload(self) -> None:
         with patch.dict(
             os.environ,
