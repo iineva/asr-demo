@@ -70,9 +70,9 @@ def get_settings() -> Dict[str, Any]:
         "max_upload_size_bytes": int(float(os.getenv("MAX_UPLOAD_SIZE_MB", "100")) * 1024 * 1024),
         "ffmpeg_timeout_seconds": int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "300")),
         "transcribe_timeout_seconds": int(os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "1800")),
-        "preload_model": os.getenv("PRELOAD_MODEL_ON_STARTUP", "false").lower() == "true",
-        "ws_partial_min_bytes": max(1, int(os.getenv("WS_PARTIAL_MIN_BYTES", "32768"))),
-        "ws_partial_min_interval_ms": max(0, int(os.getenv("WS_PARTIAL_MIN_INTERVAL_MS", "700"))),
+        "preload_model": os.getenv("PRELOAD_MODEL_ON_STARTUP", "true").lower() == "true",
+        "ws_partial_min_bytes": max(1, int(os.getenv("WS_PARTIAL_MIN_BYTES", "131072"))),
+        "ws_partial_min_interval_ms": max(0, int(os.getenv("WS_PARTIAL_MIN_INTERVAL_MS", "1200"))),
     }
 
 
