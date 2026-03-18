@@ -6,6 +6,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -70,6 +71,8 @@ def get_settings() -> Dict[str, Any]:
         "ffmpeg_timeout_seconds": int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "300")),
         "transcribe_timeout_seconds": int(os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "1800")),
         "preload_model": os.getenv("PRELOAD_MODEL_ON_STARTUP", "false").lower() == "true",
+        "ws_partial_min_bytes": max(1, int(os.getenv("WS_PARTIAL_MIN_BYTES", "32768"))),
+        "ws_partial_min_interval_ms": max(0, int(os.getenv("WS_PARTIAL_MIN_INTERVAL_MS", "700"))),
     }
 
 
@@ -124,15 +127,26 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
     wav_path = None  # type: Optional[Path]
 
     try:
+        start_time = monotonic()
         source_path = await save_upload_file(file, settings["upload_dir"], settings["max_upload_size_bytes"])
+        upload_elapsed_ms = int((monotonic() - start_time) * 1000)
         wav_path = await convert_audio_to_wav(
             str(source_path),
             settings["output_dir"],
             settings["ffmpeg_timeout_seconds"],
         )
+        convert_elapsed_ms = int((monotonic() - start_time) * 1000) - upload_elapsed_ms
         result = await asyncio.wait_for(
             transcribe_audio(str(wav_path), requested_language),
             timeout=settings["transcribe_timeout_seconds"],
+        )
+        transcribe_elapsed_ms = int((monotonic() - start_time) * 1000) - upload_elapsed_ms - convert_elapsed_ms
+        LOGGER.info(
+            "transcribe timing: upload=%sms convert=%sms decode=%sms total=%sms",
+            upload_elapsed_ms,
+            convert_elapsed_ms,
+            transcribe_elapsed_ms,
+            int((monotonic() - start_time) * 1000),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -212,6 +226,8 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
     requested_language = "auto"
     mime_type = "audio/webm"
     audio_buffer = bytearray()
+    last_partial_bytes = 0
+    last_partial_at = 0.0
 
     try:
         while True:
@@ -228,6 +244,9 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     mime_type = payload.get("mime_type", "audio/webm")
                     session = StreamingTranscriptionSession(language=requested_language)
                     source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
+                    audio_buffer.clear()
+                    last_partial_bytes = 0
+                    last_partial_at = 0.0
                     await websocket.send_json(session.emit_progress("queued"))
                     continue
 
@@ -250,8 +269,26 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                         transcribe_audio(str(wav_path), requested_language),
                         timeout=settings["transcribe_timeout_seconds"],
                     )
-                    for event in session.apply_transcription_result(result):
-                        await websocket.send_json(event)
+                    final_segments = result.get("segments", [])
+                    detected_language = result.get("detected_language") or requested_language
+                    session.latest_language = detected_language
+                    pending_segments = final_segments[len(session.final_segments) :]
+                    if pending_segments:
+                        session.final_segments.extend(segment.copy() for segment in pending_segments)
+                        tail_segment = pending_segments[-1]
+                        await websocket.send_json(
+                            {
+                                "type": "final_segment",
+                                "sequence": session._next_sequence(),
+                                "session_id": session.session_id,
+                                "text": result.get("text", tail_segment.get("text", "")),
+                                "start": float(pending_segments[0].get("start", 0.0) or 0.0),
+                                "end": float(tail_segment.get("end", 0.0) or 0.0),
+                                "is_final": True,
+                                "language": detected_language,
+                                "detail": None,
+                            }
+                        )
                     await websocket.send_json(session.emit_completed(result))
                     break
 
@@ -264,8 +301,22 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     )
                     break
                 audio_buffer.extend(message["bytes"])
+                current_size = len(audio_buffer)
                 if source_path is None:
                     source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
+
+                bytes_since_last_partial = current_size - last_partial_bytes
+                elapsed_since_last_partial_ms = int((monotonic() - last_partial_at) * 1000) if last_partial_at else None
+                if (
+                    bytes_since_last_partial < settings["ws_partial_min_bytes"]
+                    and (
+                        elapsed_since_last_partial_ms is None
+                        or elapsed_since_last_partial_ms < settings["ws_partial_min_interval_ms"]
+                    )
+                ):
+                    await websocket.send_json(session.emit_progress("partial_segment", detail={"bytes_received": current_size}))
+                    continue
+
                 write_bytes(source_path, audio_buffer)
                 try:
                     wav_path = await convert_audio_to_wav(
@@ -283,11 +334,13 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                             await websocket.send_json(event)
                     else:
                         await websocket.send_json(
-                            session.emit_progress("partial_segment", detail={"bytes_received": len(audio_buffer)})
+                            session.emit_progress("partial_segment", detail={"bytes_received": current_size})
                         )
+                    last_partial_bytes = current_size
+                    last_partial_at = monotonic()
                 except FFmpegError:
                     await websocket.send_json(
-                        session.emit_progress("partial_segment", detail={"bytes_received": len(audio_buffer)})
+                        session.emit_progress("partial_segment", detail={"bytes_received": current_size})
                     )
     except WebSocketDisconnect:
         return
