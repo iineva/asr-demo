@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from app.asr import ASRTranscriber
@@ -35,6 +36,15 @@ class AsrTranscriberTests(unittest.TestCase):
         self.assertEqual(model.last_kwargs["task"], "transcribe")
         self.assertEqual(model.last_kwargs["language"], "my")
         self.assertIn("မြန်မာ", model.last_kwargs["initial_prompt"])
+
+    def test_transcribe_uses_overridden_myanmar_prompt_from_env(self) -> None:
+        model = DummyModel()
+        transcriber = ASRTranscriber(model=model, device="cpu")
+
+        with patch.dict("os.environ", {"WHISPER_INITIAL_PROMPT_MY": "USE_CUSTOM_PROMPT"}, clear=False):
+            transcriber._transcribe_sync("sample.wav", "my")
+
+        self.assertEqual(model.last_kwargs["initial_prompt"], "USE_CUSTOM_PROMPT")
 
 
 if __name__ == "__main__":

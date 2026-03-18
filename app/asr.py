@@ -12,7 +12,7 @@ from app.utils import normalize_text
 LOGGER = logging.getLogger("asr.model")
 _MODEL_LOCK = Lock()
 _MODEL_INSTANCE = None  # type: Optional["ASRTranscriber"]
-_MYANMAR_SCRIPT_PROMPT = "ကျေးဇူးပြု၍ မြန်မာဘာသာ စာသားကို မြန်မာအက္ခရာဖြင့်သာ ပြန်ရေးပါ။"
+_DEFAULT_MYANMAR_SCRIPT_PROMPT = "ကျေးဇူးပြု၍ မြန်မာဘာသာ စာသားကို မြန်မာအက္ခရာဖြင့်သာ ပြန်ရေးပါ။"
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class ASRTranscriber:
         if language != "auto":
             kwargs["language"] = language
         if language == "my":
-            kwargs["initial_prompt"] = _MYANMAR_SCRIPT_PROMPT
+            kwargs["initial_prompt"] = os.getenv("WHISPER_INITIAL_PROMPT_MY", _DEFAULT_MYANMAR_SCRIPT_PROMPT)
 
         segments, info = self.model.transcribe(file_path, **kwargs)
         normalized_segments = []
