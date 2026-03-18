@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import tempfile
 import wave
 from dataclasses import dataclass
 from functools import lru_cache
@@ -36,6 +37,7 @@ class MmsSettings:
     model_id: str
     device: str
     torch_dtype: str
+    vad_filter: bool
 
 
 def _read_bool_env(name: str, default: bool) -> bool:
@@ -92,6 +94,7 @@ def get_mms_settings() -> MmsSettings:
         model_id=os.getenv("MMS_MODEL_ID", "facebook/mms-1b-all"),
         device=preferred_device,
         torch_dtype=os.getenv("MMS_TORCH_DTYPE", "float32").lower(),
+        vad_filter=_read_bool_env("MMS_VAD_FILTER", True),
     )
 
 
@@ -102,6 +105,9 @@ class ASRTranscriber:
 
     async def transcribe(self, file_path: str, language: str) -> Dict[str, Any]:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
+
+    async def detect_language(self, file_path: str) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._detect_language_sync, file_path)
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
         started_at = monotonic()
@@ -159,6 +165,34 @@ class ASRTranscriber:
             },
         }
 
+    def _detect_language_sync(self, file_path: str) -> Dict[str, Any]:
+        settings = get_model_settings()
+        detect_seconds = max(1.0, float(os.getenv("WHISPER_LANGUAGE_DETECT_SECONDS", "3.0")))
+        preview_path = _create_preview_wav(file_path, detect_seconds)
+        started_at = monotonic()
+        LOGGER.info("detect_language step=start file=%s preview=%s duration_s=%s", file_path, preview_path, detect_seconds)
+        try:
+            _segments, info = self.model.transcribe(
+                preview_path,
+                beam_size=1,
+                vad_filter=settings.vad_filter,
+                task="transcribe",
+            )
+            result = {
+                "language": getattr(info, "language", None),
+                "language_probability": round(float(getattr(info, "language_probability", 0.0)), 4),
+            }
+            LOGGER.info(
+                "detect_language step=done elapsed_ms=%s language=%s probability=%s",
+                int((monotonic() - started_at) * 1000),
+                result["language"],
+                result["language_probability"],
+            )
+            return result
+        finally:
+            if preview_path != file_path and os.path.exists(preview_path):
+                os.remove(preview_path)
+
     def _build_transcribe_kwargs(self, language: str, settings: ModelSettings) -> Dict[str, Any]:
         kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
         if language != "auto":
@@ -210,12 +244,16 @@ class MmsTranscriber:
         *,
         audio_loader: Optional[Any] = None,
         duration_getter: Optional[Any] = None,
+        vad_filter: bool = False,
+        vad_processor: Optional[Any] = None,
     ) -> None:
         self.processor = processor
         self.model = model
         self.device = device
         self.audio_loader = audio_loader or _load_audio_waveform
         self.duration_getter = duration_getter or _get_audio_duration_seconds
+        self.vad_filter = vad_filter
+        self.vad_processor = vad_processor or _apply_mms_vad
 
     async def transcribe(self, file_path: str, language: str) -> Dict[str, Any]:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
@@ -224,13 +262,17 @@ class MmsTranscriber:
         started_at = monotonic()
         LOGGER.info("mms decode step=start file=%s language=%s device=%s", file_path, language, self.device)
         waveform, sample_rate = self.audio_loader(file_path)
+        vad_elapsed_ms = 0
+        if self.vad_filter:
+            waveform, vad_elapsed_ms = self.vad_processor(waveform, sample_rate)
+            LOGGER.info("mms decode step=vad_done elapsed_ms=%s", vad_elapsed_ms)
         inputs = self.processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt")
         prepared_inputs = _prepare_model_inputs(inputs, self.device)
         outputs = self.model(**prepared_inputs)
         generated_ids = outputs.logits.argmax(dim=-1)
 
         text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        result = self._normalize_result(text, self.duration_getter(file_path), language)
+        result = self._normalize_result(text, self.duration_getter(file_path), language, vad_elapsed_ms=vad_elapsed_ms)
         LOGGER.info(
             "mms decode step=done elapsed_ms=%s text_len=%s",
             int((monotonic() - started_at) * 1000),
@@ -238,7 +280,7 @@ class MmsTranscriber:
         )
         return result
 
-    def _normalize_result(self, text: str, duration_seconds: float, language: str) -> Dict[str, Any]:
+    def _normalize_result(self, text: str, duration_seconds: float, language: str, *, vad_elapsed_ms: int = 0) -> Dict[str, Any]:
         normalized_text = normalize_text(text)
         segments = []
         if normalized_text:
@@ -257,7 +299,7 @@ class MmsTranscriber:
             "text": normalized_text,
             "segments": segments,
             "timing": {
-                "vad_ms": 0,
+                "vad_ms": max(0, int(vad_elapsed_ms)),
             },
         }
 
@@ -268,9 +310,33 @@ class TranscriberRouter:
         self.mms_getter = mms_getter
 
     async def transcribe(self, file_path: str, language: str) -> Dict[str, Any]:
+        whisper_transcriber = self.whisper_getter()
         if language == "my":
             return await self.mms_getter().transcribe(file_path, language)
-        return await self.whisper_getter().transcribe(file_path, language)
+        if language != "auto":
+            return await whisper_transcriber.transcribe(file_path, language)
+
+        detection = await whisper_transcriber.detect_language(file_path)
+        detected_language = detection.get("language")
+        detected_probability = detection.get("language_probability", 0.0)
+        if detected_language == "my":
+            LOGGER.info("router step=reroute_auto_to_mms file=%s detected_language=my", file_path)
+            mms_result = await self.mms_getter().transcribe(file_path, "my")
+            rerouted_result = dict(mms_result)
+            rerouted_result["requested_language"] = "auto"
+            rerouted_result["detected_language"] = "my"
+            rerouted_result["language_probability"] = detected_probability
+            return rerouted_result
+
+        whisper_language = detected_language or "auto"
+        whisper_result = await whisper_transcriber.transcribe(file_path, whisper_language)
+        if detected_language is None:
+            return whisper_result
+        rerouted_result = dict(whisper_result)
+        rerouted_result["requested_language"] = "auto"
+        rerouted_result["detected_language"] = detected_language
+        rerouted_result["language_probability"] = detected_probability
+        return rerouted_result
 
 
 def _is_cuda_available() -> bool:
@@ -309,6 +375,46 @@ def _get_audio_duration_seconds(file_path: str) -> float:
     if frame_rate <= 0:
         return 0.0
     return frame_count / frame_rate
+
+
+def _create_preview_wav(file_path: str, max_seconds: float) -> str:
+    with wave.open(file_path, "rb") as source:
+        frame_rate = source.getframerate()
+        if frame_rate <= 0:
+            return file_path
+        preview_frames = min(source.getnframes(), int(frame_rate * max_seconds))
+        if preview_frames <= 0 or preview_frames >= source.getnframes():
+            return file_path
+        preview_audio = source.readframes(preview_frames)
+        sample_width = source.getsampwidth()
+        channel_count = source.getnchannels()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as preview_file:
+        preview_path = preview_file.name
+
+    with wave.open(preview_path, "wb") as target:
+        target.setnchannels(channel_count)
+        target.setsampwidth(sample_width)
+        target.setframerate(frame_rate)
+        target.writeframes(preview_audio)
+
+    return preview_path
+
+
+def _apply_mms_vad(waveform: Any, sample_rate: int) -> tuple[Any, int]:
+    import torch
+    import torchaudio.functional as audio_functional
+
+    started_at = monotonic()
+    trimmed = audio_functional.vad(waveform, sample_rate)
+    if hasattr(trimmed, "numel") and trimmed.numel() > 0:
+        reversed_trimmed = torch.flip(trimmed, dims=[-1])
+        tail_trimmed = audio_functional.vad(reversed_trimmed, sample_rate)
+        if hasattr(tail_trimmed, "numel") and tail_trimmed.numel() > 0:
+            trimmed = torch.flip(tail_trimmed, dims=[-1])
+    else:
+        trimmed = waveform
+    return trimmed, int((monotonic() - started_at) * 1000)
 
 
 def _prepare_model_inputs(inputs: Any, device: str) -> Dict[str, Any]:
@@ -397,7 +503,12 @@ def _create_mms_transcriber() -> MmsTranscriber:
         settings.torch_dtype,
         target_lang,
     )
-    return MmsTranscriber(processor=processor, model=model, device=settings.device)
+    return MmsTranscriber(
+        processor=processor,
+        model=model,
+        device=settings.device,
+        vad_filter=settings.vad_filter,
+    )
 
 
 def get_whisper_transcriber() -> ASRTranscriber:

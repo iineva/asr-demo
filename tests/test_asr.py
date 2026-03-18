@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 from app.asr import ASRTranscriber, MmsTranscriber, TranscriberRouter
@@ -41,6 +42,18 @@ class RecordingAsyncTranscriber:
     async def transcribe(self, file_path: str, language: str):
         self.calls.append((file_path, language))
         return self.payload
+
+
+class RecordingWhisperRouterTranscriber(RecordingAsyncTranscriber):
+    def __init__(self, payload, *, detected_language: Optional[str], language_probability: float) -> None:
+        super().__init__(payload)
+        self.detected_language = detected_language
+        self.language_probability = language_probability
+        self.detect_calls = []
+
+    async def detect_language(self, file_path: str):
+        self.detect_calls.append(file_path)
+        return {"language": self.detected_language, "language_probability": self.language_probability}
 
 
 class FakeProcessor:
@@ -195,14 +208,66 @@ class AsrTranscriberTests(unittest.TestCase):
         self.assertEqual(whisper.calls, [])
 
     def test_transcriber_router_routes_auto_to_whisper(self) -> None:
-        whisper = RecordingAsyncTranscriber({"engine": "whisper"})
+        whisper = RecordingWhisperRouterTranscriber(
+            {"requested_language": "yue", "detected_language": "yue", "language_probability": 0.99, "text": "你好", "segments": []},
+            detected_language="yue",
+            language_probability=0.99,
+        )
         mms = RecordingAsyncTranscriber({"engine": "mms"})
         router = TranscriberRouter(whisper_getter=lambda: whisper, mms_getter=lambda: mms)
 
         result = asyncio.run(router.transcribe("sample.wav", "auto"))
 
-        self.assertEqual(result, {"engine": "whisper"})
+        self.assertEqual(whisper.detect_calls, ["sample.wav"])
+        self.assertEqual(whisper.calls, [("sample.wav", "yue")])
+        self.assertEqual(result["requested_language"], "auto")
+        self.assertEqual(result["detected_language"], "yue")
+        self.assertEqual(result["language_probability"], 0.99)
+        self.assertEqual(mms.calls, [])
+
+    def test_transcriber_router_reroutes_auto_myanmar_detection_to_mms(self) -> None:
+        whisper = RecordingWhisperRouterTranscriber(
+            {"requested_language": "auto", "detected_language": "my", "language_probability": 0.91, "text": "latin fallback", "segments": []},
+            detected_language="my",
+            language_probability=0.91,
+        )
+        mms = RecordingAsyncTranscriber(
+            {
+                "requested_language": "my",
+                "detected_language": "my",
+                "language_probability": 1.0,
+                "text": "မင်္ဂလာပါ",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "မင်္ဂလာပါ"}],
+                "timing": {"vad_ms": 0},
+            }
+        )
+        router = TranscriberRouter(whisper_getter=lambda: whisper, mms_getter=lambda: mms)
+
+        result = asyncio.run(router.transcribe("sample.wav", "auto"))
+
+        self.assertEqual(whisper.detect_calls, ["sample.wav"])
+        self.assertEqual(whisper.calls, [])
+        self.assertEqual(mms.calls, [("sample.wav", "my")])
+        self.assertEqual(result["requested_language"], "auto")
+        self.assertEqual(result["detected_language"], "my")
+        self.assertEqual(result["language_probability"], 0.91)
+        self.assertEqual(result["text"], "မင်္ဂလာပါ")
+        self.assertEqual(result["segments"], [{"start": 0.0, "end": 1.0, "text": "မင်္ဂလာပါ"}])
+
+    def test_transcriber_router_falls_back_to_whisper_auto_when_detection_unknown(self) -> None:
+        whisper = RecordingWhisperRouterTranscriber(
+            {"requested_language": "auto", "detected_language": "auto", "language_probability": 0.4, "text": "fallback", "segments": []},
+            detected_language=None,
+            language_probability=0.0,
+        )
+        mms = RecordingAsyncTranscriber({"engine": "mms"})
+        router = TranscriberRouter(whisper_getter=lambda: whisper, mms_getter=lambda: mms)
+
+        result = asyncio.run(router.transcribe("sample.wav", "auto"))
+
+        self.assertEqual(whisper.detect_calls, ["sample.wav"])
         self.assertEqual(whisper.calls, [("sample.wav", "auto")])
+        self.assertEqual(result["text"], "fallback")
         self.assertEqual(mms.calls, [])
 
     def test_transcriber_router_routes_yue_to_whisper(self) -> None:
@@ -284,6 +349,27 @@ class AsrTranscriberTests(unittest.TestCase):
         self.assertEqual(len(end_calls), 1)
         self.assertEqual(end_calls[0][2], len("မင်္ဂလာပါ"))
 
+    def test_mms_transcriber_applies_vad_when_enabled(self) -> None:
+        processor = FakeProcessor()
+        model = FakeMmsModel()
+        vad_calls = []
+
+        transcriber = MmsTranscriber(
+            processor=processor,
+            model=model,
+            device="cpu",
+            audio_loader=lambda _path: (FakeTensor(), 16000),
+            duration_getter=lambda _path: 2.25,
+            vad_filter=True,
+            vad_processor=lambda waveform, sample_rate: (vad_calls.append((waveform, sample_rate)) or waveform, 37),
+        )
+
+        result = asyncio.run(transcriber.transcribe("sample.wav", "my"))
+
+        self.assertEqual(len(vad_calls), 1)
+        self.assertEqual(vad_calls[0][1], 16000)
+        self.assertEqual(result["timing"]["vad_ms"], 37)
+
     def test_get_mms_settings_reads_runtime_env(self) -> None:
         from app import asr
 
@@ -318,7 +404,12 @@ class AsrTranscriberTests(unittest.TestCase):
         fake_processor = object()
         fake_model = FakeMmsModel()
         fake_model.to = lambda device: fake_model
-        fake_settings = asr.MmsSettings(model_id="facebook/mms-1b-all", device="mps", torch_dtype="float16")
+        fake_settings = asr.MmsSettings(
+            model_id="facebook/mms-1b-all",
+            device="mps",
+            torch_dtype="float16",
+            vad_filter=True,
+        )
 
         with patch("app.asr.get_mms_settings", return_value=fake_settings), patch(
             "app.asr._load_mms_processor", return_value=fake_processor
@@ -371,14 +462,16 @@ class AsrTranscriberTests(unittest.TestCase):
     def test_transcribe_audio_auto_does_not_initialize_mms(self) -> None:
         from app import asr
 
-        whisper = RecordingAsyncTranscriber(
+        whisper = RecordingWhisperRouterTranscriber(
             {
-                "requested_language": "auto",
+                "requested_language": "yue",
                 "detected_language": "yue",
                 "language_probability": 0.99,
                 "text": "test",
                 "segments": [],
-            }
+            },
+            detected_language="yue",
+            language_probability=0.99,
         )
 
         with patch("app.asr.get_whisper_transcriber", return_value=whisper), patch(
@@ -387,7 +480,8 @@ class AsrTranscriberTests(unittest.TestCase):
             result = asyncio.run(asr.transcribe_audio("sample.wav", "auto"))
 
         self.assertEqual(result["text"], "test")
-        self.assertEqual(whisper.calls, [("sample.wav", "auto")])
+        self.assertEqual(whisper.detect_calls, ["sample.wav"])
+        self.assertEqual(whisper.calls, [("sample.wav", "yue")])
 
 
 if __name__ == "__main__":

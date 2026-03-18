@@ -18,14 +18,18 @@
 - `WHISPER_COMPUTE_TYPE_CPU`：建议 `int8`。
 - `WHISPER_BEAM_SIZE`：解码束宽。追求速度建议 `1`~`2`（`docker-compose.yml` 默认已设为 `1`）。
 - `WHISPER_VAD_FILTER`：默认 `true`。若输入语音已经很干净、且更想压缩处理时间，可手动设为 `false`。
+- `WHISPER_LANGUAGE_DETECT_SECONDS`：`auto` 路径用于语言检测的前置预览音频时长，默认 `3.0` 秒。越短越快，但误判风险会上升。
 - `MMS_MODEL_ID`：缅语 MMS 模型 ID，默认 `facebook/mms-1b-all`。
 - `MMS_DEVICE`：`auto` / `cuda` / `mps` / `cpu`。仅作用于缅语 MMS 路径；在 Apple Silicon 上，`auto` 会优先选择 `mps`。
 - `MMS_TORCH_DTYPE`：MMS 推理 dtype，默认 `float32`。
+- `MMS_VAD_FILTER`：默认 `true`。会在 MMS 前置裁掉前后静音，降低缅语重转写时的无效计算。
 - `PRELOAD_MODEL_ON_STARTUP`：设为 `true` 可减少首请求冷启动延迟（服务默认开启）。
 - `WS_PARTIAL_MIN_BYTES`：WebSocket 增量识别最小字节增量，默认 `131072`，避免每个小 chunk 都触发全量重识别。
 - `WS_PARTIAL_MIN_INTERVAL_MS`：WebSocket 增量识别最小触发间隔，默认 `1200` 毫秒，降低高频转码与解码开销。
 
 另外，Whisper 和 MMS 模型实例都会在进程内单例缓存，不会在每次识别请求时重复初始化；慢通常来自首轮冷启动、ffmpeg 转码或过于高频的 WebSocket 增量全量重识别。首次使用缅语时还会发生 Hugging Face 模型下载，镜像和冷启动都会比原来更重。
+
+当前 `language=auto` 的策略是先用 Whisper 对前几秒音频做语言检测；如果检测到缅语，再放弃首轮文本，切到 MMS 做完整转写。这样比直接让 Whisper 先完整转一遍再改路由要快得多。
 
 MMS 初始化完成后，日志会输出一条 `mms runtime initialized ...`，明确当前实际使用的 `device` 和 `torch_dtype`，便于确认在 Mac mini M4 上是否已经跑到 `mps`。
 

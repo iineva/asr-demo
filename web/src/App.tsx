@@ -489,7 +489,7 @@ export default function App({
           <p className="eyebrow">Voice Bridge</p>
           <h1>按住说话，松开发送</h1>
           <p className="hero-copy">
-            面向手机测试的实时语音输入页，支持缅甸语、粤语和自动识别。
+            支持缅甸语、粤语、普通话、英语等多种语言的自动识别。
           </p>
 
           <label className="language-field">
