@@ -69,7 +69,7 @@ def get_settings() -> Dict[str, Any]:
         "output_dir": os.getenv("OUTPUT_DIR", "outputs"),
         "max_upload_size_bytes": int(float(os.getenv("MAX_UPLOAD_SIZE_MB", "100")) * 1024 * 1024),
         "ffmpeg_timeout_seconds": int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "300")),
-        "transcribe_timeout_seconds": int(os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "1800")),
+        "transcribe_timeout_seconds": int(os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "300")),
         "ws_partial_transcribe_timeout_seconds": max(
             1,
             int(os.getenv("WS_PARTIAL_TRANSCRIBE_TIMEOUT_SECONDS", "30")),
@@ -106,6 +106,11 @@ app.add_middleware(
 api_router = APIRouter(prefix="/api")
 
 
+@app.get("/health")
+async def health_legacy() -> Dict[str, Any]:
+    return {"success": True, "status": "ok"}
+
+
 @api_router.get("/health")
 async def health() -> Dict[str, Any]:
     return {"success": True, "status": "ok"}
@@ -123,6 +128,8 @@ async def ready() -> JSONResponse:
 @api_router.post("/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto")) -> Dict[str, Any]:
     settings = get_settings()
+    request_id = uuid.uuid4().hex
+    last_step = "init"
     try:
         requested_language = validate_language(language)
     except ValueError as exc:
@@ -133,21 +140,52 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
 
     try:
         start_time = monotonic()
+        last_step = "upload_start"
+        LOGGER.info(
+            "transcribe request_id=%s step=upload_start filename=%s language=%s",
+            request_id,
+            file.filename,
+            requested_language,
+        )
         source_path = await save_upload_file(file, settings["upload_dir"], settings["max_upload_size_bytes"])
+        last_step = "upload_done"
         upload_elapsed_ms = int((monotonic() - start_time) * 1000)
+        LOGGER.info(
+            "transcribe request_id=%s step=upload_done elapsed_ms=%s path=%s size_bytes=%s",
+            request_id,
+            upload_elapsed_ms,
+            source_path,
+            source_path.stat().st_size if source_path.exists() else 0,
+        )
+        convert_started_at = monotonic()
+        last_step = "convert_start"
+        LOGGER.info("transcribe request_id=%s step=convert_start source=%s", request_id, source_path)
         wav_path = await convert_audio_to_wav(
             str(source_path),
             settings["output_dir"],
             settings["ffmpeg_timeout_seconds"],
         )
-        convert_elapsed_ms = int((monotonic() - start_time) * 1000) - upload_elapsed_ms
+        convert_elapsed_ms = int((monotonic() - convert_started_at) * 1000)
+        last_step = "convert_done"
+        LOGGER.info("transcribe request_id=%s step=convert_done elapsed_ms=%s wav=%s", request_id, convert_elapsed_ms, wav_path)
+        decode_started_at = monotonic()
+        last_step = "decode_start"
+        LOGGER.info("transcribe request_id=%s step=decode_start wav=%s", request_id, wav_path)
         result = await asyncio.wait_for(
             transcribe_audio(str(wav_path), requested_language),
             timeout=settings["transcribe_timeout_seconds"],
         )
-        transcribe_elapsed_ms = int((monotonic() - start_time) * 1000) - upload_elapsed_ms - convert_elapsed_ms
+        transcribe_elapsed_ms = int((monotonic() - decode_started_at) * 1000)
+        last_step = "decode_done"
         LOGGER.info(
-            "transcribe timing: upload=%sms convert=%sms decode=%sms total=%sms",
+            "transcribe request_id=%s step=decode_done elapsed_ms=%s text_len=%s",
+            request_id,
+            transcribe_elapsed_ms,
+            len(result.get("text", "")),
+        )
+        LOGGER.info(
+            "transcribe request_id=%s timing: upload=%sms convert=%sms decode=%sms total=%sms",
+            request_id,
             upload_elapsed_ms,
             convert_elapsed_ms,
             transcribe_elapsed_ms,
@@ -156,13 +194,25 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FFmpegError as exc:
+        LOGGER.warning("transcribe request_id=%s last_step=%s ffmpeg_error=%s", request_id, last_step, str(exc))
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {exc}") from exc
     except asyncio.TimeoutError as exc:
+        LOGGER.warning(
+            "transcribe request_id=%s last_step=%s timeout_seconds=%s",
+            request_id,
+            last_step,
+            settings["transcribe_timeout_seconds"],
+        )
         raise HTTPException(status_code=500, detail="transcription timed out") from exc
     except HTTPException:
         raise
     except Exception as exc:
-        LOGGER.exception("transcription failed")
+        LOGGER.exception(
+            "transcribe request_id=%s step=failed last_step=%s total_elapsed_ms=%s",
+            request_id,
+            last_step,
+            int((monotonic() - start_time) * 1000),
+        )
         raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from exc
     finally:
         remove_file_safely(source_path)
@@ -173,6 +223,8 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
 @api_router.post("/transcribe/stream")
 async def transcribe_stream(file: UploadFile = File(...), language: str = Form("auto")) -> StreamingResponse:
     settings = get_settings()
+    request_id = uuid.uuid4().hex
+    last_step = "init"
     try:
         requested_language = validate_language(language)
     except ValueError as exc:
@@ -182,22 +234,60 @@ async def transcribe_stream(file: UploadFile = File(...), language: str = Form("
     wav_path = None  # type: Optional[Path]
     session = StreamingTranscriptionSession(language=requested_language)
 
+    stream_started_at = monotonic()
     try:
+        last_step = "upload_start"
+        LOGGER.info(
+            "transcribe_stream request_id=%s step=upload_start filename=%s language=%s",
+            request_id,
+            file.filename,
+            requested_language,
+        )
         source_path = await save_upload_file(file, settings["upload_dir"], settings["max_upload_size_bytes"])
+        last_step = "upload_done"
+        LOGGER.info(
+            "transcribe_stream request_id=%s step=upload_done elapsed_ms=%s path=%s size_bytes=%s",
+            request_id,
+            int((monotonic() - stream_started_at) * 1000),
+            source_path,
+            source_path.stat().st_size if source_path.exists() else 0,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def run_transcription() -> Dict[str, Any]:
         nonlocal wav_path
+        convert_started_at = monotonic()
+        nonlocal last_step
+        last_step = "convert_start"
+        LOGGER.info("transcribe_stream request_id=%s step=convert_start source=%s", request_id, source_path)
         wav_path = await convert_audio_to_wav(
             str(source_path),
             settings["output_dir"],
             settings["ffmpeg_timeout_seconds"],
         )
-        return await asyncio.wait_for(
+        LOGGER.info(
+            "transcribe_stream request_id=%s step=convert_done elapsed_ms=%s wav=%s",
+            request_id,
+            int((monotonic() - convert_started_at) * 1000),
+            wav_path,
+        )
+        decode_started_at = monotonic()
+        last_step = "decode_start"
+        LOGGER.info("transcribe_stream request_id=%s step=decode_start wav=%s", request_id, wav_path)
+        result = await asyncio.wait_for(
             transcribe_audio(str(wav_path), requested_language),
             timeout=settings["transcribe_timeout_seconds"],
         )
+        LOGGER.info(
+            "transcribe_stream request_id=%s step=decode_done elapsed_ms=%s text_len=%s total_elapsed_ms=%s",
+            request_id,
+            int((monotonic() - decode_started_at) * 1000),
+            len(result.get("text", "")),
+            int((monotonic() - stream_started_at) * 1000),
+        )
+        last_step = "decode_done"
+        return result
 
     async def event_stream():
         try:
@@ -206,11 +296,23 @@ async def transcribe_stream(file: UploadFile = File(...), language: str = Form("
         except ValueError as exc:
             yield (json.dumps(session.emit_error(str(exc)), ensure_ascii=False) + "\n").encode("utf-8")
         except FFmpegError as exc:
+            LOGGER.warning("transcribe_stream request_id=%s last_step=%s ffmpeg_error=%s", request_id, last_step, str(exc))
             yield (json.dumps(session.emit_error(f"ffmpeg failed: {exc}"), ensure_ascii=False) + "\n").encode("utf-8")
         except asyncio.TimeoutError:
+            LOGGER.warning(
+                "transcribe_stream request_id=%s last_step=%s timeout_seconds=%s",
+                request_id,
+                last_step,
+                settings["transcribe_timeout_seconds"],
+            )
             yield (json.dumps(session.emit_error("transcription timed out"), ensure_ascii=False) + "\n").encode("utf-8")
         except Exception as exc:
-            LOGGER.exception("streaming transcription failed")
+            LOGGER.exception(
+                "transcribe_stream request_id=%s step=failed last_step=%s total_elapsed_ms=%s",
+                request_id,
+                last_step,
+                int((monotonic() - stream_started_at) * 1000),
+            )
             yield (json.dumps(session.emit_error(f"transcription failed: {exc}"), ensure_ascii=False) + "\n").encode(
                 "utf-8"
             )
@@ -250,6 +352,12 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     session = StreamingTranscriptionSession(language=requested_language)
                     source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
                     source_path.touch(exist_ok=False)
+                    LOGGER.info(
+                        "ws_transcribe step=session_started session_id=%s language=%s mime_type=%s",
+                        session.session_id,
+                        requested_language,
+                        mime_type,
+                    )
                     received_bytes = 0
                     last_partial_bytes = 0
                     last_partial_at = 0.0
@@ -269,14 +377,30 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     if received_bytes <= 0:
                         await websocket.send_json(session.emit_error("audio stream is empty"))
                         break
+                    convert_started_at = monotonic()
+                    LOGGER.info("ws_transcribe step=final_convert_start session_id=%s source=%s", session.session_id, source_path)
                     wav_path = await convert_audio_to_wav(
                         str(source_path),
                         settings["output_dir"],
                         settings["ffmpeg_timeout_seconds"],
                     )
+                    LOGGER.info(
+                        "ws_transcribe step=final_convert_done session_id=%s elapsed_ms=%s wav=%s",
+                        session.session_id,
+                        int((monotonic() - convert_started_at) * 1000),
+                        wav_path,
+                    )
+                    decode_started_at = monotonic()
+                    LOGGER.info("ws_transcribe step=final_decode_start session_id=%s", session.session_id)
                     result = await asyncio.wait_for(
                         transcribe_audio(str(wav_path), requested_language),
                         timeout=settings["transcribe_timeout_seconds"],
+                    )
+                    LOGGER.info(
+                        "ws_transcribe step=final_decode_done session_id=%s elapsed_ms=%s text_len=%s",
+                        session.session_id,
+                        int((monotonic() - decode_started_at) * 1000),
+                        len(result.get("text", "")),
                     )
                     final_segments = result.get("segments", [])
                     detected_language = result.get("detected_language") or requested_language
@@ -319,6 +443,12 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                 append_bytes(source_path, chunk)
                 received_bytes += len(chunk)
                 current_size = received_bytes
+                LOGGER.info(
+                    "ws_transcribe step=chunk_received session_id=%s bytes_received=%s chunk_size=%s",
+                    session.session_id,
+                    current_size,
+                    len(chunk),
+                )
 
                 bytes_since_last_partial = current_size - last_partial_bytes
                 elapsed_since_last_partial_ms = int((monotonic() - last_partial_at) * 1000) if last_partial_at else None
@@ -333,17 +463,29 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     continue
 
                 try:
+                    partial_convert_started_at = monotonic()
                     wav_path = await convert_audio_to_wav(
                         str(source_path),
                         settings["output_dir"],
                         settings["ffmpeg_timeout_seconds"],
                         tail_seconds=settings["ws_partial_window_seconds"],
                     )
+                    partial_convert_elapsed_ms = int((monotonic() - partial_convert_started_at) * 1000)
+                    partial_decode_started_at = monotonic()
                     result = await asyncio.wait_for(
                         transcribe_audio(str(wav_path), requested_language),
                         timeout=settings["ws_partial_transcribe_timeout_seconds"],
                     )
+                    partial_decode_elapsed_ms = int((monotonic() - partial_decode_started_at) * 1000)
                     emitted = session.apply_transcription_result(result)
+                    LOGGER.info(
+                        "ws_transcribe step=partial_decoded session_id=%s convert_ms=%s decode_ms=%s emitted_events=%s bytes_received=%s",
+                        session.session_id,
+                        partial_convert_elapsed_ms,
+                        partial_decode_elapsed_ms,
+                        len(emitted),
+                        current_size,
+                    )
                     if emitted:
                         for event in emitted:
                             await websocket.send_json(event)

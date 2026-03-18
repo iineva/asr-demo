@@ -15,7 +15,7 @@ services:
       TRANSFORMERS_CACHE: /app/model-cache/transformers
       MAX_UPLOAD_SIZE_MB: 100
       FFMPEG_TIMEOUT_SECONDS: 300
-      TRANSCRIBE_TIMEOUT_SECONDS: 1800
+      TRANSCRIBE_TIMEOUT_SECONDS: 300
       PRELOAD_MODEL_ON_STARTUP: "true"
       # large-v3,medium,small
       WHISPER_MODEL_SIZE: large-v3

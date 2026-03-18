@@ -27,6 +27,7 @@ type InteractionState =
   | "error";
 
 const CANCEL_THRESHOLD = 120;
+const REALTIME_COMPLETION_TIMEOUT_MS = 45000;
 
 function formatProbability(value: number): string {
   return `${Math.round(value * 100)}%`;
@@ -256,16 +257,23 @@ export default function App({
           resolveCompletion = resolve;
           rejectCompletion = reject;
         });
+        const completionTimeoutId = window.setTimeout(() => {
+          if (!isSettled) {
+            realtimeCompletionRef.current?.reject(new Error("录音流式识别超时，请重试"));
+          }
+        }, REALTIME_COMPLETION_TIMEOUT_MS);
         realtimeCompletionRef.current = {
           promise: completionPromise,
           resolve: (result) => {
             isSettled = true;
+            window.clearTimeout(completionTimeoutId);
             realtimeCompletionRef.current = null;
             realtimeSocketRef.current = null;
             resolveCompletion(result);
           },
           reject: (error) => {
             isSettled = true;
+            window.clearTimeout(completionTimeoutId);
             realtimeCompletionRef.current = null;
             realtimeSocketRef.current = null;
             rejectCompletion(error);
@@ -296,7 +304,13 @@ export default function App({
           if (typeof messageEvent.data !== "string") {
             return;
           }
-          const payload = JSON.parse(messageEvent.data) as TranscriptStreamEvent;
+          let payload: TranscriptStreamEvent;
+          try {
+            payload = JSON.parse(messageEvent.data) as TranscriptStreamEvent;
+          } catch {
+            realtimeCompletionRef.current?.reject(new Error("录音流式识别响应格式错误"));
+            return;
+          }
           if (payload.type === "error") {
             realtimeCompletionRef.current?.reject(new Error(payload.detail?.message ?? "录音流式识别失败"));
             return;
@@ -310,6 +324,12 @@ export default function App({
         socket.addEventListener("error", () => {
           if (!isSettled) {
             realtimeCompletionRef.current?.reject(new Error("录音流式识别失败"));
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          if (!isSettled) {
+            realtimeCompletionRef.current?.reject(new Error("录音流式连接已断开，请重试"));
           }
         });
       }
@@ -368,16 +388,19 @@ export default function App({
     try {
       const blob = await session.stop();
       if (realtimeSocketRef.current && realtimeCompletionRef.current) {
-        realtimeSocketRef.current.send(JSON.stringify({ type: "finish" }));
-        const nextResult = await realtimeCompletionRef.current.promise;
-        setHistoryItems((previous) => [
-          createHistoryItem(nextResult, "recorded", blob, registerObjectUrl),
-          ...previous,
-        ]);
-        setLiveResult(null);
+        if (realtimeSocketRef.current.readyState === WebSocket.OPEN) {
+          realtimeSocketRef.current.send(JSON.stringify({ type: "finish" }));
+          const nextResult = await realtimeCompletionRef.current.promise;
+          setHistoryItems((previous) => [
+            createHistoryItem(nextResult, "recorded", blob, registerObjectUrl),
+            ...previous,
+          ]);
+          setLiveResult(null);
+          resetRealtimeSession();
+          setStatus("success");
+          return;
+        }
         resetRealtimeSession();
-        setStatus("success");
-        return;
       }
       await runTranscription(blob, "录音上传失败", "recorded");
     } catch (uploadError) {
