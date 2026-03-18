@@ -46,6 +46,26 @@ class AsrTranscriberTests(unittest.TestCase):
 
         self.assertEqual(model.last_kwargs["initial_prompt"], "USE_CUSTOM_PROMPT")
 
+    def test_transcribe_uses_runtime_beam_and_vad_settings(self) -> None:
+        model = DummyModel()
+        transcriber = ASRTranscriber(model=model, device="cpu")
+
+        with patch.dict(
+            "os.environ",
+            {"WHISPER_BEAM_SIZE": "3", "WHISPER_VAD_FILTER": "false"},
+            clear=False,
+        ):
+            from app import asr
+
+            asr.get_model_settings.cache_clear()
+            try:
+                transcriber._transcribe_sync("sample.wav", "auto")
+            finally:
+                asr.get_model_settings.cache_clear()
+
+        self.assertEqual(model.last_kwargs["beam_size"], 3)
+        self.assertFalse(model.last_kwargs["vad_filter"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,15 @@ class ModelSettings:
     device_preference: str
     cuda_compute_type: str
     cpu_compute_type: str
+    beam_size: int
+    vad_filter: bool
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=1)
@@ -30,6 +39,8 @@ def get_model_settings() -> ModelSettings:
         device_preference=os.getenv("WHISPER_DEVICE", "auto").lower(),
         cuda_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CUDA", "float16"),
         cpu_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CPU", "int8"),
+        beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "5"))),
+        vad_filter=_read_bool_env("WHISPER_VAD_FILTER", True),
     )
 
 
@@ -42,7 +53,8 @@ class ASRTranscriber:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
-        kwargs = {"beam_size": 5, "vad_filter": True, "task": "transcribe"}
+        settings = get_model_settings()
+        kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
         if language != "auto":
             kwargs["language"] = language
         if language == "my":
