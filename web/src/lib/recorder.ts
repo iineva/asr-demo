@@ -1,6 +1,8 @@
 export type RecorderSession = {
   stop: () => Promise<Blob>;
   cancel: () => Promise<void>;
+  mimeType?: string;
+  onChunk?: (listener: (chunk: Blob) => void) => () => void;
 };
 
 function pickMimeType(): string {
@@ -20,22 +22,31 @@ export async function createRecorderSession(): Promise<RecorderSession> {
 
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const chunks: BlobPart[] = [];
+  const chunkListeners = new Set<(chunk: Blob) => void>();
   const mimeType = pickMimeType();
   const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
 
   recorder.addEventListener("dataavailable", (event) => {
     if (event.data && event.data.size > 0) {
       chunks.push(event.data);
+      chunkListeners.forEach((listener) => listener(event.data));
     }
   });
 
-  recorder.start();
+  recorder.start(300);
 
   const stopTracks = () => {
     stream.getTracks().forEach((track) => track.stop());
   };
 
   return {
+    mimeType: mimeType || "audio/webm",
+    onChunk: (listener) => {
+      chunkListeners.add(listener);
+      return () => {
+        chunkListeners.delete(listener);
+      };
+    },
     stop: () =>
       new Promise<Blob>((resolve, reject) => {
         recorder.addEventListener(

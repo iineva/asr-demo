@@ -143,6 +143,45 @@ describe("App", () => {
     expect((await screen.findAllByText("မင်္ဂလာပါ")).length).toBeGreaterThan(0);
   });
 
+  it("renders streaming transcript updates before upload completion", async () => {
+    let resolveStream: (value: {
+      requested_language: "auto";
+      detected_language: "yue";
+      language_probability: number;
+      text: string;
+      segments: { start: number; end: number; text: string }[];
+    }) => void = () => {
+      /* placeholder */
+    };
+
+    const mockStream = vi.fn().mockImplementation(
+      (_file: Blob, _language: string, onEvent?: (event: { type: string; text: string; language: string }) => void) => {
+        onEvent?.({ type: "partial_segment", text: "流式中", language: "yue" });
+        return new Promise((resolve) => {
+          resolveStream = resolve;
+        });
+      },
+    );
+
+    render(<App transcribeAudioStream={mockStream} />);
+
+    const input = screen.getByLabelText(/上传音频文件/i) as HTMLInputElement;
+    const file = new File(["audio"], "sample.webm", { type: "audio/webm" });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("流式中")).toBeInTheDocument();
+
+    resolveStream({
+      requested_language: "auto",
+      detected_language: "yue",
+      language_probability: 0.97,
+      text: "最终结果",
+      segments: [{ start: 0, end: 1.2, text: "最终结果" }],
+    });
+
+    expect(await screen.findByText("最终结果")).toBeInTheDocument();
+  });
+
   it("renders multiple successful transcriptions as history items", async () => {
     const mockTranscribe = vi
       .fn()

@@ -72,4 +72,38 @@ describe("transcribeAudio", () => {
     expect((uploadFile as File).name).toBe("recording.m4a");
     expect((uploadFile as File).type).toBe("audio/mp4");
   });
+
+  it("falls back to the legacy upload endpoint when streamed transcription fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        body: null,
+        text: vi.fn().mockResolvedValue(JSON.stringify({ type: "queued", text: "", language: "auto", detail: null })),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          result: {
+            requested_language: "auto",
+            detected_language: "yue",
+            language_probability: 0.9,
+            text: "fallback result",
+            segments: [],
+          },
+        }),
+      });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const result = await transcribeAudio(new Blob(["audio"], { type: "audio/webm" }), "auto");
+      expect(result.text).toBe("fallback result");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/transcribe/stream");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/transcribe");
+  });
 });

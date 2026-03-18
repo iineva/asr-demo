@@ -1,18 +1,6 @@
-import type { TranscriptResult, TranscriptSegment } from "../types";
+import type { TranscriptResult, TranscriptStreamEvent } from "../types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api";
-
-type StreamEvent = {
-  type: string;
-  text: string;
-  language: string | null;
-  detail?: {
-    requested_language?: TranscriptResult["requested_language"];
-    segments?: TranscriptSegment[];
-    language_probability?: number;
-    message?: string;
-  } | null;
-};
 
 function inferUploadFilename(file: Blob): string {
   const normalizedType = file.type.toLowerCase();
@@ -32,15 +20,14 @@ function inferUploadFilename(file: Blob): string {
   return "recording.webm";
 }
 
-function parseStreamEvents(payload: string): StreamEvent[] {
-  return payload
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as StreamEvent);
+function buildUploadFile(file: Blob): File {
+  return file instanceof File ? file : new File([file], inferUploadFilename(file), { type: file.type || "audio/webm" });
 }
 
-function buildTranscriptResultFromEvent(event: StreamEvent, fallbackLanguage: string): TranscriptResult {
+function buildTranscriptResultFromEvent(
+  event: TranscriptStreamEvent,
+  fallbackLanguage: string,
+): TranscriptResult {
   const segments = event.detail?.segments ?? [];
   return {
     requested_language: (event.detail?.requested_language ?? fallbackLanguage) as TranscriptResult["requested_language"],
@@ -51,31 +38,100 @@ function buildTranscriptResultFromEvent(event: StreamEvent, fallbackLanguage: st
   };
 }
 
-async function readResponseText(response: Response): Promise<string> {
-  if (response.body) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let combined = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      combined += decoder.decode(value, { stream: true });
-    }
-
-    combined += decoder.decode();
-    return combined;
-  }
-
-  return await response.text();
+function parseEventLine(line: string): TranscriptStreamEvent {
+  return JSON.parse(line) as TranscriptStreamEvent;
 }
 
-export async function transcribeAudio(file: Blob, language: string): Promise<TranscriptResult> {
+async function consumeTextResponse(
+  response: Response,
+  onEvent?: (event: TranscriptStreamEvent) => void,
+): Promise<TranscriptStreamEvent[]> {
+  const payload = await response.text();
+  return payload
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const event = parseEventLine(line);
+      onEvent?.(event);
+      return event;
+    });
+}
+
+async function consumeNdjsonResponse(
+  response: Response,
+  onEvent?: (event: TranscriptStreamEvent) => void,
+): Promise<TranscriptStreamEvent[]> {
+  if (!response.body) {
+    return await consumeTextResponse(response, onEvent);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events: TranscriptStreamEvent[] = [];
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const event = parseEventLine(trimmed);
+      events.push(event);
+      onEvent?.(event);
+    }
+  }
+
+  buffer += decoder.decode();
+  const tail = buffer.trim();
+  if (tail) {
+    const event = parseEventLine(tail);
+    events.push(event);
+    onEvent?.(event);
+  }
+
+  return events;
+}
+
+async function postLegacyTranscription(uploadFile: File, language: string): Promise<TranscriptResult> {
   const formData = new FormData();
-  const uploadFile =
-    file instanceof File ? file : new File([file], inferUploadFilename(file), { type: file.type || "audio/webm" });
+  formData.append("file", uploadFile);
+  formData.append("language", language);
+
+  const response = await fetch(`${API_BASE_URL}/transcribe`, {
+    method: "POST",
+    body: formData,
+  });
+
+  const payload = (await response.json()) as {
+    detail?: string;
+    result?: TranscriptResult;
+  };
+
+  if (!response.ok || !payload.result) {
+    throw new Error(payload.detail ?? "转写失败");
+  }
+
+  return payload.result;
+}
+
+export async function transcribeAudioStream(
+  file: Blob,
+  language: string,
+  onEvent?: (event: TranscriptStreamEvent) => void,
+): Promise<TranscriptResult> {
+  const uploadFile = buildUploadFile(file);
+  const formData = new FormData();
   formData.append("file", uploadFile);
   formData.append("language", language);
 
@@ -84,8 +140,7 @@ export async function transcribeAudio(file: Blob, language: string): Promise<Tra
     body: formData,
   });
 
-  const payloadText = await readResponseText(response);
-  const streamEvents = parseStreamEvents(payloadText);
+  const streamEvents = await consumeNdjsonResponse(response, onEvent);
 
   if (!response.ok) {
     const errorEvent = streamEvents.find((event) => event.type === "error");
@@ -99,4 +154,14 @@ export async function transcribeAudio(file: Blob, language: string): Promise<Tra
   }
 
   return buildTranscriptResultFromEvent(completedEvent, language);
+}
+
+export async function transcribeAudio(file: Blob, language: string): Promise<TranscriptResult> {
+  const uploadFile = buildUploadFile(file);
+
+  try {
+    return await transcribeAudioStream(uploadFile, language);
+  } catch {
+    return await postLegacyTranscription(uploadFile, language);
+  }
 }

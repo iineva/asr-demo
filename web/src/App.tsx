@@ -1,14 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import { transcribeAudio as defaultTranscribeAudio } from "./lib/api";
+import { transcribeAudio as defaultTranscribeAudio, transcribeAudioStream as defaultTranscribeAudioStream } from "./lib/api";
 import {
   createRecorderSession as defaultCreateRecorderSession,
   type RecorderSession,
 } from "./lib/recorder";
-import type { TranscriptResult, TranscriptHistoryItem } from "./types";
+import type { TranscriptHistoryItem, TranscriptResult, TranscriptSegment, TranscriptStreamEvent } from "./types";
 
 type Props = {
   transcribeAudio?: (blob: Blob, language: string) => Promise<TranscriptResult>;
+  transcribeAudioStream?: (
+    blob: Blob,
+    language: string,
+    onEvent?: (event: TranscriptStreamEvent) => void,
+  ) => Promise<TranscriptResult>;
   createRecorderSession?: () => Promise<RecorderSession>;
+  createRealtimeSocket?: () => WebSocket;
 };
 
 type InteractionState =
@@ -31,6 +37,11 @@ function formatDuration(milliseconds: number): string {
   const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
   const seconds = String(totalSeconds % 60).padStart(2, "0");
   return `${minutes}:${seconds}`;
+}
+
+function createDefaultRealtimeSocket(): WebSocket {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return new WebSocket(`${protocol}://${window.location.host}/api/ws/transcribe`);
 }
 
 function createHistoryItem(
@@ -58,12 +69,15 @@ function createHistoryItem(
 
 export default function App({
   transcribeAudio = defaultTranscribeAudio,
+  transcribeAudioStream = defaultTranscribeAudioStream,
   createRecorderSession = defaultCreateRecorderSession,
+  createRealtimeSocket = createDefaultRealtimeSocket,
 }: Props) {
   const [language, setLanguage] = useState<"auto" | "my" | "yue">("auto");
   const [status, setStatus] = useState<InteractionState>("idle");
   const [error, setError] = useState("");
   const [historyItems, setHistoryItems] = useState<TranscriptHistoryItem[]>([]);
+  const [liveResult, setLiveResult] = useState<TranscriptResult | null>(null);
   const [durationMs, setDurationMs] = useState(0);
 
   const startYRef = useRef<number | null>(null);
@@ -75,6 +89,13 @@ export default function App({
   const cancelSlashRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const objectUrlRegistryRef = useRef<Set<string>>(new Set());
+  const realtimeSocketRef = useRef<WebSocket | null>(null);
+  const realtimeUnsubscribeRef = useRef<(() => void) | null>(null);
+  const realtimeCompletionRef = useRef<{
+    promise: Promise<TranscriptResult>;
+    resolve: (result: TranscriptResult) => void;
+    reject: (error: Error) => void;
+  } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -85,6 +106,8 @@ export default function App({
         URL.revokeObjectURL(url);
       });
       objectUrlRegistryRef.current.clear();
+      realtimeUnsubscribeRef.current?.();
+      realtimeSocketRef.current?.close();
     };
   }, []);
 
@@ -106,6 +129,65 @@ export default function App({
     objectUrlRegistryRef.current.add(url);
   };
 
+  const buildLiveResultFromEvent = (event: TranscriptStreamEvent) => {
+    setLiveResult((previous) => {
+      const previousSegments = previous?.segments ?? [];
+      const nextSegments: TranscriptSegment[] = [...previousSegments];
+
+      if (event.type === "final_segment") {
+        nextSegments.push({
+          start: 0,
+          end: 0,
+          text: event.text,
+        });
+      }
+
+      if (event.type === "partial_segment") {
+        const finalizedSegments = nextSegments.filter((segment) => !segment.text.startsWith("__partial__:"));
+        finalizedSegments.push({
+          start: 0,
+          end: 0,
+          text: `__partial__:${event.text}`,
+        });
+        return {
+          requested_language: previous?.requested_language ?? language,
+          detected_language: event.language,
+          language_probability: previous?.language_probability ?? 0,
+          text: [...finalizedSegments.map((segment) => segment.text.replace(/^__partial__:/, ""))].join(" ").trim(),
+          segments: finalizedSegments,
+        };
+      }
+
+      if (event.type === "completed") {
+        return {
+          requested_language: (event.detail?.requested_language ?? language) as TranscriptResult["requested_language"],
+          detected_language: event.language,
+          language_probability: event.detail?.language_probability ?? 0,
+          text: event.text,
+          segments: event.detail?.segments ?? nextSegments,
+        };
+      }
+
+      return previous;
+    });
+  };
+
+  const buildCompletedResult = (event: TranscriptStreamEvent): TranscriptResult => ({
+    requested_language: (event.detail?.requested_language ?? language) as TranscriptResult["requested_language"],
+    detected_language: event.language,
+    language_probability: event.detail?.language_probability ?? 0,
+    text: event.text,
+    segments: event.detail?.segments ?? [],
+  });
+
+  const resetRealtimeSession = () => {
+    realtimeUnsubscribeRef.current?.();
+    realtimeUnsubscribeRef.current = null;
+    realtimeSocketRef.current?.close();
+    realtimeSocketRef.current = null;
+    realtimeCompletionRef.current = null;
+  };
+
   const runTranscription = async (
     source: Blob | File,
     uploadErrorMessage: string,
@@ -114,13 +196,20 @@ export default function App({
     try {
       setError("");
       setStatus("uploading");
-      const nextResult = await transcribeAudio(source, language);
+      setLiveResult(null);
+      const shouldUseLegacyTranscribe =
+        transcribeAudio !== defaultTranscribeAudio && transcribeAudioStream === defaultTranscribeAudioStream;
+      const nextResult = shouldUseLegacyTranscribe
+        ? await transcribeAudio(source, language)
+        : await transcribeAudioStream(source, language, buildLiveResultFromEvent);
       setHistoryItems((previous) => [
         createHistoryItem(nextResult, sourceType, source, registerObjectUrl),
         ...previous,
       ]);
+      setLiveResult(null);
       setStatus("success");
     } catch (uploadError) {
+      setLiveResult(null);
       setStatus("error");
       setError(uploadError instanceof Error ? uploadError.message : uploadErrorMessage);
     }
@@ -150,6 +239,81 @@ export default function App({
         return;
       }
       sessionRef.current = session;
+      setLiveResult(null);
+
+      if (session.onChunk) {
+        const socket = createRealtimeSocket();
+        realtimeSocketRef.current = socket;
+        let isSettled = false;
+        const pendingChunks: Blob[] = [];
+        let resolveCompletion: (result: TranscriptResult) => void = () => {
+          /* placeholder */
+        };
+        let rejectCompletion: (error: Error) => void = () => {
+          /* placeholder */
+        };
+        const completionPromise = new Promise<TranscriptResult>((resolve, reject) => {
+          resolveCompletion = resolve;
+          rejectCompletion = reject;
+        });
+        realtimeCompletionRef.current = {
+          promise: completionPromise,
+          resolve: (result) => {
+            isSettled = true;
+            realtimeCompletionRef.current = null;
+            realtimeSocketRef.current = null;
+            resolveCompletion(result);
+          },
+          reject: (error) => {
+            isSettled = true;
+            realtimeCompletionRef.current = null;
+            realtimeSocketRef.current = null;
+            rejectCompletion(error);
+          },
+        };
+
+        const sendChunk = async (chunk: Blob) => {
+          const targetSocket = realtimeSocketRef.current;
+          if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
+            pendingChunks.push(chunk);
+            return;
+          }
+          targetSocket.send(await chunk.arrayBuffer());
+        };
+
+        realtimeUnsubscribeRef.current = session.onChunk((chunk) => {
+          void sendChunk(chunk);
+        });
+
+        socket.addEventListener("open", () => {
+          socket.send(JSON.stringify({ type: "start", language, mime_type: session.mimeType ?? "audio/webm" }));
+          pendingChunks.splice(0).forEach((chunk) => {
+            void sendChunk(chunk);
+          });
+        });
+
+        socket.addEventListener("message", (messageEvent) => {
+          if (typeof messageEvent.data !== "string") {
+            return;
+          }
+          const payload = JSON.parse(messageEvent.data) as TranscriptStreamEvent;
+          if (payload.type === "error") {
+            realtimeCompletionRef.current?.reject(new Error(payload.detail?.message ?? "录音流式识别失败"));
+            return;
+          }
+          buildLiveResultFromEvent(payload);
+          if (payload.type === "completed") {
+            realtimeCompletionRef.current?.resolve(buildCompletedResult(payload));
+          }
+        });
+
+        socket.addEventListener("error", () => {
+          if (!isSettled) {
+            realtimeCompletionRef.current?.reject(new Error("录音流式识别失败"));
+          }
+        });
+      }
+
       startedAtRef.current = Date.now();
       setStatus("recording");
       timerRef.current = window.setInterval(() => {
@@ -195,14 +359,29 @@ export default function App({
 
     if (cancelled) {
       await session.cancel();
+      resetRealtimeSession();
+      setLiveResult(null);
       setStatus("idle");
       return;
     }
 
     try {
       const blob = await session.stop();
+      if (realtimeSocketRef.current && realtimeCompletionRef.current) {
+        realtimeSocketRef.current.send(JSON.stringify({ type: "finish" }));
+        const nextResult = await realtimeCompletionRef.current.promise;
+        setHistoryItems((previous) => [
+          createHistoryItem(nextResult, "recorded", blob, registerObjectUrl),
+          ...previous,
+        ]);
+        setLiveResult(null);
+        resetRealtimeSession();
+        setStatus("success");
+        return;
+      }
       await runTranscription(blob, "录音上传失败", "recorded");
     } catch (uploadError) {
+      resetRealtimeSession();
       setStatus("error");
       setError(uploadError instanceof Error ? uploadError.message : "录音上传失败");
     }
@@ -238,7 +417,7 @@ export default function App({
   };
 
   const latestHistoryItem = historyItems[0];
-  const latestResult = latestHistoryItem?.result ?? null;
+  const latestResult = liveResult ?? latestHistoryItem?.result ?? null;
   const previousHistoryItems = historyItems.slice(1);
 
   return (
@@ -289,7 +468,7 @@ export default function App({
                 <p>{latestResult.text}</p>
               </article>
 
-              {latestHistoryItem ? <audio controls src={latestHistoryItem.audioUrl} /> : null}
+              {!liveResult && latestHistoryItem ? <audio controls src={latestHistoryItem.audioUrl} /> : null}
 
               <div className="segment-list">
                 {latestResult.segments.map((segment, index) => (
@@ -297,7 +476,7 @@ export default function App({
                     <span className="segment-time">
                       {segment.start.toFixed(1)}s - {segment.end.toFixed(1)}s
                     </span>
-                    <p>{segment.text}</p>
+                    <p>{segment.text.replace(/^__partial__:/, "")}</p>
                   </article>
                 ))}
               </div>
