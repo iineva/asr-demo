@@ -11,3 +11,13 @@ export type TranscriptResult = {
   text: string;
   segments: TranscriptSegment[];
 };
+
+export type TranscriptHistoryItem = {
+  id: string;
+  createdAt: string;
+  sourceType: "recorded" | "uploaded";
+  audioName: string;
+  audioBlob: Blob;
+  audioUrl: string;
+  result: TranscriptResult;
+};

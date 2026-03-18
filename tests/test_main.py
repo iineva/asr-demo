@@ -151,6 +151,91 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 500)
             self.assertEqual(response.json()["detail"], "transcription failed: model boom")
 
+    async def test_transcribe_stream_returns_progressive_events(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "UPLOAD_DIR": self.upload_dir,
+                "OUTPUT_DIR": self.output_dir,
+                "MAX_UPLOAD_SIZE_MB": "5",
+            },
+            clear=False,
+        ):
+            from app.main import app
+            from httpx import ASGITransport, AsyncClient
+
+            mocked_result = {
+                "requested_language": "auto",
+                "detected_language": "yue",
+                "language_probability": 0.97,
+                "text": "hello world",
+                "segments": [
+                    {"start": 0.0, "end": 0.5, "text": "hello"},
+                    {"start": 0.5, "end": 1.0, "text": "world"},
+                ],
+            }
+
+            with patch("app.main.convert_audio_to_wav", new=AsyncMock(return_value="/tmp/audio.wav")), patch(
+                "app.main.transcribe_audio", new=AsyncMock(return_value=mocked_result)
+            ):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as client:
+                    response = await client.post(
+                        "/api/transcribe/stream",
+                        files={"file": ("sample.wav", io.BytesIO(b"fake"), "audio/wav")},
+                        data={"language": "auto"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        lines = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        self.assertEqual(lines[0]["type"], "queued")
+        self.assertEqual(lines[1]["type"], "preprocessing")
+        self.assertIn("completed", [line["type"] for line in lines])
+
+    def test_websocket_stream_emits_partial_then_completed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "UPLOAD_DIR": self.upload_dir,
+                "OUTPUT_DIR": self.output_dir,
+                "MAX_UPLOAD_SIZE_MB": "5",
+            },
+            clear=False,
+        ):
+            from fastapi.testclient import TestClient
+            from app.main import app
+
+            mocked_result = {
+                "requested_language": "auto",
+                "detected_language": "yue",
+                "language_probability": 0.97,
+                "text": "hello world",
+                "segments": [
+                    {"start": 0.0, "end": 0.5, "text": "hello"},
+                    {"start": 0.5, "end": 1.0, "text": "world"},
+                ],
+            }
+
+            with patch("app.main.convert_audio_to_wav", new=AsyncMock(return_value="/tmp/audio.wav")), patch(
+                "app.main.transcribe_audio", new=AsyncMock(return_value=mocked_result)
+            ):
+                with TestClient(app) as client:
+                    with client.websocket_connect("/api/ws/transcribe") as websocket:
+                        websocket.send_json({"type": "start", "language": "auto", "mime_type": "audio/webm"})
+                        queued_event = websocket.receive_json()
+                        self.assertEqual(queued_event["type"], "queued")
+
+                        websocket.send_bytes(b"chunk")
+                        partial_event = websocket.receive_json()
+                        self.assertEqual(partial_event["type"], "partial_segment")
+
+                        websocket.send_json({"type": "finish"})
+                        final_event = websocket.receive_json()
+                        completed_event = websocket.receive_json()
+
+        self.assertEqual(final_event["type"], "final_segment")
+        self.assertEqual(completed_event["type"], "completed")
+
 
 class LoggingTests(unittest.TestCase):
     def test_json_formatter_includes_exception_details(self) -> None:

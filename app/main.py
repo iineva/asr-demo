@@ -1,17 +1,24 @@
 import asyncio
-import traceback
 import json
 import logging
 import os
+import traceback
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.asr import get_transcriber, transcribe_audio
+from app.streaming import (
+    StreamingTranscriptionSession,
+    iter_file_upload_events,
+    mime_type_to_extension,
+    write_bytes,
+)
 from app.utils import (
     FFmpegError,
     convert_audio_to_wav,
@@ -142,6 +149,145 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
         remove_file_safely(source_path)
 
     return {"success": True, "result": result}
+
+
+@api_router.post("/transcribe/stream")
+async def transcribe_stream(file: UploadFile = File(...), language: str = Form("auto")) -> StreamingResponse:
+    settings = get_settings()
+    try:
+        requested_language = validate_language(language)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_path = None  # type: Optional[Path]
+    wav_path = None  # type: Optional[Path]
+    session = StreamingTranscriptionSession(language=requested_language)
+
+    try:
+        source_path = await save_upload_file(file, settings["upload_dir"], settings["max_upload_size_bytes"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def run_transcription() -> Dict[str, Any]:
+        nonlocal wav_path
+        wav_path = await convert_audio_to_wav(
+            str(source_path),
+            settings["output_dir"],
+            settings["ffmpeg_timeout_seconds"],
+        )
+        return await asyncio.wait_for(
+            transcribe_audio(str(wav_path), requested_language),
+            timeout=settings["transcribe_timeout_seconds"],
+        )
+
+    async def event_stream():
+        try:
+            async for event in iter_file_upload_events(session=session, transcribe_result=run_transcription):
+                yield event
+        except ValueError as exc:
+            yield (json.dumps(session.emit_error(str(exc)), ensure_ascii=False) + "\n").encode("utf-8")
+        except FFmpegError as exc:
+            yield (json.dumps(session.emit_error(f"ffmpeg failed: {exc}"), ensure_ascii=False) + "\n").encode("utf-8")
+        except asyncio.TimeoutError:
+            yield (json.dumps(session.emit_error("transcription timed out"), ensure_ascii=False) + "\n").encode("utf-8")
+        except Exception as exc:
+            LOGGER.exception("streaming transcription failed")
+            yield (json.dumps(session.emit_error(f"transcription failed: {exc}"), ensure_ascii=False) + "\n").encode(
+                "utf-8"
+            )
+        finally:
+            remove_file_safely(wav_path)
+            remove_file_safely(source_path)
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@api_router.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket) -> None:
+    await websocket.accept()
+    settings = get_settings()
+    source_path = None  # type: Optional[Path]
+    wav_path = None  # type: Optional[Path]
+    session: Optional[StreamingTranscriptionSession] = None
+    requested_language = "auto"
+    mime_type = "audio/webm"
+    audio_buffer = bytearray()
+
+    try:
+        while True:
+            message = await websocket.receive()
+            message_type = message.get("type")
+
+            if message_type == "websocket.disconnect":
+                break
+
+            if "text" in message and message["text"] is not None:
+                payload = json.loads(message["text"])
+                if payload.get("type") == "start":
+                    requested_language = validate_language(payload.get("language", "auto"))
+                    mime_type = payload.get("mime_type", "audio/webm")
+                    session = StreamingTranscriptionSession(language=requested_language)
+                    await websocket.send_json(session.emit_progress("queued"))
+                    continue
+
+                if payload.get("type") == "finish":
+                    if session is None:
+                        await websocket.send_json(
+                            StreamingTranscriptionSession(language=requested_language).emit_error("session not started")
+                        )
+                        break
+
+                    extension = mime_type_to_extension(mime_type)
+                    source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{extension}"
+                    write_bytes(source_path, audio_buffer)
+                    wav_path = await convert_audio_to_wav(
+                        str(source_path),
+                        settings["output_dir"],
+                        settings["ffmpeg_timeout_seconds"],
+                    )
+                    result = await asyncio.wait_for(
+                        transcribe_audio(str(wav_path), requested_language),
+                        timeout=settings["transcribe_timeout_seconds"],
+                    )
+                    for event in session.apply_transcription_result(result):
+                        await websocket.send_json(event)
+                    await websocket.send_json(session.emit_completed(result))
+                    break
+
+                continue
+
+            if "bytes" in message and message["bytes"] is not None:
+                if session is None:
+                    await websocket.send_json(
+                        StreamingTranscriptionSession(language=requested_language).emit_error("session not started")
+                    )
+                    break
+                audio_buffer.extend(message["bytes"])
+                await websocket.send_json(
+                    session.emit_progress(
+                        "partial_segment",
+                        detail={"bytes_received": len(audio_buffer)},
+                    )
+                )
+    except WebSocketDisconnect:
+        return
+    except ValueError as exc:
+        if session is not None:
+            await websocket.send_json(session.emit_error(str(exc)))
+    except FFmpegError as exc:
+        if session is not None:
+            await websocket.send_json(session.emit_error(f"ffmpeg failed: {exc}"))
+    except asyncio.TimeoutError:
+        if session is not None:
+            await websocket.send_json(session.emit_error("transcription timed out"))
+    except Exception as exc:
+        LOGGER.exception("websocket transcription failed")
+        if session is not None:
+            await websocket.send_json(session.emit_error(f"transcription failed: {exc}"))
+    finally:
+        remove_file_safely(wav_path)
+        remove_file_safely(source_path)
+        await websocket.close()
 
 
 app.include_router(api_router)

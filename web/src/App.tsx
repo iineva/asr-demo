@@ -4,7 +4,7 @@ import {
   createRecorderSession as defaultCreateRecorderSession,
   type RecorderSession,
 } from "./lib/recorder";
-import type { TranscriptResult } from "./types";
+import type { TranscriptResult, TranscriptHistoryItem } from "./types";
 
 type Props = {
   transcribeAudio?: (blob: Blob, language: string) => Promise<TranscriptResult>;
@@ -33,6 +33,29 @@ function formatDuration(milliseconds: number): string {
   return `${minutes}:${seconds}`;
 }
 
+function createHistoryItem(
+  result: TranscriptResult,
+  sourceType: TranscriptHistoryItem["sourceType"],
+  source: Blob | File,
+  registerObjectUrl?: (url: string) => void,
+): TranscriptHistoryItem {
+  const isFileAvailable = typeof File !== "undefined" && source instanceof File;
+  const audioName = isFileAvailable ? source.name : sourceType === "uploaded" ? "上传音频" : "录音";
+  const audioUrl = URL.createObjectURL(source);
+
+  registerObjectUrl?.(audioUrl);
+
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    createdAt: new Date().toISOString(),
+    sourceType,
+    audioName,
+    audioBlob: source,
+    audioUrl,
+    result,
+  };
+}
+
 export default function App({
   transcribeAudio = defaultTranscribeAudio,
   createRecorderSession = defaultCreateRecorderSession,
@@ -40,20 +63,28 @@ export default function App({
   const [language, setLanguage] = useState<"auto" | "my" | "yue">("auto");
   const [status, setStatus] = useState<InteractionState>("idle");
   const [error, setError] = useState("");
-  const [result, setResult] = useState<TranscriptResult | null>(null);
+  const [historyItems, setHistoryItems] = useState<TranscriptHistoryItem[]>([]);
   const [durationMs, setDurationMs] = useState(0);
 
   const startYRef = useRef<number | null>(null);
   const sessionRef = useRef<RecorderSession | null>(null);
   const timerRef = useRef<number | null>(null);
   const startedAtRef = useRef<number | null>(null);
+  const isPointerDownRef = useRef(false);
+  const sessionRequestIdRef = useRef<number | null>(null);
+  const cancelSlashRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const objectUrlRegistryRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     return () => {
       if (timerRef.current) {
         window.clearInterval(timerRef.current);
       }
+      objectUrlRegistryRef.current.forEach((url) => {
+        URL.revokeObjectURL(url);
+      });
+      objectUrlRegistryRef.current.clear();
     };
   }, []);
 
@@ -71,12 +102,23 @@ export default function App({
     setDurationMs(0);
   };
 
-  const runTranscription = async (source: Blob | File, uploadErrorMessage: string) => {
+  const registerObjectUrl = (url: string) => {
+    objectUrlRegistryRef.current.add(url);
+  };
+
+  const runTranscription = async (
+    source: Blob | File,
+    uploadErrorMessage: string,
+    sourceType: TranscriptHistoryItem["sourceType"],
+  ) => {
     try {
       setError("");
       setStatus("uploading");
       const nextResult = await transcribeAudio(source, language);
-      setResult(nextResult);
+      setHistoryItems((previous) => [
+        createHistoryItem(nextResult, sourceType, source, registerObjectUrl),
+        ...previous,
+      ]);
       setStatus("success");
     } catch (uploadError) {
       setStatus("error");
@@ -96,9 +138,17 @@ export default function App({
     setError("");
     setStatus("requesting");
     startYRef.current = event.clientY;
+    cancelSlashRef.current = false;
+    isPointerDownRef.current = true;
+    const requestId = (sessionRequestIdRef.current ?? 0) + 1;
+    sessionRequestIdRef.current = requestId;
 
     try {
       const session = await createRecorderSession();
+      if (!isPointerDownRef.current || sessionRequestIdRef.current !== requestId) {
+        await session.cancel();
+        return;
+      }
       sessionRef.current = session;
       startedAtRef.current = Date.now();
       setStatus("recording");
@@ -108,6 +158,9 @@ export default function App({
         }
       }, 100);
     } catch (sessionError) {
+      if (sessionRequestIdRef.current !== requestId) {
+        return;
+      }
       resetGesture();
       setStatus("error");
       setError(sessionError instanceof Error ? sessionError.message : "无法启动录音");
@@ -115,7 +168,7 @@ export default function App({
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (!sessionRef.current || startYRef.current === null) {
+    if (startYRef.current === null) {
       return;
     }
 
@@ -123,19 +176,24 @@ export default function App({
       [event.clientY, event.pageY, event.screenY].find((value) => typeof value === "number" && !Number.isNaN(value)) ??
       startYRef.current;
     const offset = startYRef.current - currentY;
-    setStatus(offset > CANCEL_THRESHOLD ? "cancel" : "recording");
+    const willCancel = offset > CANCEL_THRESHOLD;
+    cancelSlashRef.current = willCancel;
+    setStatus(willCancel ? "cancel" : "recording");
   };
 
   const finishRecording = async (shouldCancel = false) => {
     const session = sessionRef.current;
+    const cancelled = shouldCancel || cancelSlashRef.current || status === "cancel";
     sessionRef.current = null;
+    isPointerDownRef.current = false;
+    cancelSlashRef.current = false;
     resetGesture();
     if (!session) {
       setStatus("idle");
       return;
     }
 
-    if (shouldCancel || status === "cancel") {
+    if (cancelled) {
       await session.cancel();
       setStatus("idle");
       return;
@@ -143,7 +201,7 @@ export default function App({
 
     try {
       const blob = await session.stop();
-      await runTranscription(blob, "录音上传失败");
+      await runTranscription(blob, "录音上传失败", "recorded");
     } catch (uploadError) {
       setStatus("error");
       setError(uploadError instanceof Error ? uploadError.message : "录音上传失败");
@@ -158,6 +216,7 @@ export default function App({
   };
 
   const handlePointerCancel = async () => {
+    cancelSlashRef.current = true;
     setStatus("cancel");
     await finishRecording(true);
   };
@@ -174,122 +233,164 @@ export default function App({
     if (!file) {
       return;
     }
-    await runTranscription(file, "文件上传失败");
+    await runTranscription(file, "文件上传失败", "uploaded");
     event.target.value = "";
   };
 
+  const latestHistoryItem = historyItems[0];
+  const latestResult = latestHistoryItem?.result ?? null;
+  const previousHistoryItems = historyItems.slice(1);
+
   return (
-    <main className="page-shell">
-      <section className="hero-card">
-        <p className="eyebrow">Voice Bridge</p>
-        <h1>按住说话，松开发送</h1>
-        <p className="hero-copy">
-          面向手机测试的实时语音输入页，支持缅甸语、粤语和自动识别。
-        </p>
+    <>
+      <main className="page-shell" data-testid="page-shell">
+        <section className="hero-card">
+          <p className="eyebrow">Voice Bridge</p>
+          <h1>按住说话，松开发送</h1>
+          <p className="hero-copy">
+            面向手机测试的实时语音输入页，支持缅甸语、粤语和自动识别。
+          </p>
 
-        <label className="language-field">
-          <span>识别语言</span>
-          <select value={language} onChange={(event) => setLanguage(event.target.value as "auto" | "my" | "yue")}>
-            <option value="auto">自动识别</option>
-            <option value="my">缅甸语</option>
-            <option value="yue">粤语</option>
-          </select>
-        </label>
-      </section>
+          <label className="language-field">
+            <span>识别语言</span>
+            <select value={language} onChange={(event) => setLanguage(event.target.value as "auto" | "my" | "yue")}>
+              <option value="auto">自动识别</option>
+              <option value="my">缅甸语</option>
+              <option value="yue">粤语</option>
+            </select>
+          </label>
+        </section>
 
-      <section className={`record-panel state-${status}`}>
-        <div className="status-orb" />
-        <p className="status-label">
-          {status === "recording" && "松开发送，上滑取消"}
-          {status === "cancel" && "松手取消发送"}
-          {status === "uploading" && "正在上传并识别"}
-          {status === "requesting" && "正在请求麦克风权限"}
-          {(status === "idle" || status === "success" || status === "error") && "按住下方输入区开始说话"}
-        </p>
-        <p className="duration-label">
-          {status === "recording" || status === "cancel" ? formatDuration(durationMs) : "准备就绪"}
-        </p>
-
-        <button
-          type="button"
-          className="record-button"
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerCancel}
-          disabled={status === "requesting" || status === "uploading"}
-        >
-          <span className="record-button-inner">
-            <span className="record-button-title">按住说话</span>
-            <span className="record-button-subtitle">Hold to record</span>
-          </span>
-        </button>
-
-        <input
-          ref={fileInputRef}
-          id="audio-upload"
-          className="file-input"
-          type="file"
-          aria-label="上传音频文件"
-          accept=".m4a,.mp3,.wav,.webm,audio/*"
-          onChange={handleFileChange}
-        />
-        <button
-          type="button"
-          className="upload-button"
-          onClick={handleUploadButtonClick}
-          disabled={status === "requesting" || status === "recording" || status === "cancel" || status === "uploading"}
-        >
-          上传音频文件
-        </button>
-
-        {error ? <p className="inline-error">{error}</p> : null}
-      </section>
-
-      <section className="result-card">
-        <div className="section-header">
-          <div>
-            <p className="eyebrow">Latest Result</p>
-            <h2>识别结果</h2>
+        <section className="result-card">
+          <div className="section-header">
+            <div>
+              <p className="eyebrow">Latest Result</p>
+              <h2>识别结果</h2>
+            </div>
+            {latestResult ? (
+              <span className="badge">识别语言 {latestResult.detected_language ?? "unknown"}</span>
+            ) : null}
           </div>
-          {result ? <span className="badge">识别语言 {result.detected_language ?? "unknown"}</span> : null}
-        </div>
 
-        {result ? (
-          <>
-            <div className="result-metrics">
-              <div className="metric">
-                <span>请求语言</span>
-                <strong>{result.requested_language}</strong>
+          {latestResult ? (
+            <>
+              <div className="result-metrics">
+                <div className="metric">
+                  <span>请求语言</span>
+                  <strong>{latestResult.requested_language}</strong>
+                </div>
+                <div className="metric">
+                  <span>概率</span>
+                  <strong>{formatProbability(latestResult.language_probability)}</strong>
+                </div>
               </div>
-              <div className="metric">
-                <span>概率</span>
-                <strong>{formatProbability(result.language_probability)}</strong>
+
+              <article className="transcript-card">
+                <p>{latestResult.text}</p>
+              </article>
+
+              {latestHistoryItem ? <audio controls src={latestHistoryItem.audioUrl} /> : null}
+
+              <div className="segment-list">
+                {latestResult.segments.map((segment, index) => (
+                  <article key={`${segment.start}-${segment.end}-${index}`} className="segment-item">
+                    <span className="segment-time">
+                      {segment.start.toFixed(1)}s - {segment.end.toFixed(1)}s
+                    </span>
+                    <p>{segment.text}</p>
+                  </article>
+                ))}
+              </div>
+              {previousHistoryItems.length > 0 && (
+                <div className="history-section" data-testid="history-section">
+                  <div className="history-section-header">
+                    <p className="eyebrow">History</p>
+                    <p className="history-description">过往识别记录</p>
+                  </div>
+                  <div className="history-list">
+                    {previousHistoryItems.map((item) => (
+                      <article key={item.id} className="history-item">
+                        <span className="history-stamp">
+                          {new Date(item.createdAt).toLocaleTimeString()}
+                        </span>
+                        <p>{item.result.text}</p>
+                        <audio controls src={item.audioUrl} />
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="empty-state">
+              <p>还没有识别结果。</p>
+              <p>按住说话后松开，结果会自动显示在这里。</p>
+            </div>
+          )}
+        </section>
+      </main>
+
+      <div className="record-dock" data-testid="record-dock" aria-label="录音操作">
+        <section className={`record-panel state-${status}`}>
+          <div className="record-panel-top">
+            <div className="record-status">
+              <div className="status-orb" />
+              <div className="record-status-text">
+                <p className="status-label">
+                  {status === "recording" && "松开发送，上滑取消"}
+                  {status === "cancel" && "松手取消发送"}
+                  {status === "uploading" && "正在上传并识别"}
+                  {status === "requesting" && "正在请求麦克风权限"}
+                  {(status === "idle" || status === "success" || status === "error") && "按住下方输入区开始说话"}
+                </p>
+                <p className="duration-label">
+                  {status === "recording" || status === "cancel" ? formatDuration(durationMs) : "准备就绪"}
+                </p>
               </div>
             </div>
 
-            <article className="transcript-card">
-              <p>{result.text}</p>
-            </article>
-
-            <div className="segment-list">
-              {result.segments.map((segment, index) => (
-                <article key={`${segment.start}-${segment.end}-${index}`} className="segment-item">
-                  <span className="segment-time">
-                    {segment.start.toFixed(1)}s - {segment.end.toFixed(1)}s
-                  </span>
-                  <p>{segment.text}</p>
-                </article>
-              ))}
-            </div>
-          </>
-        ) : (
-          <div className="empty-state">
-            <p>还没有识别结果。</p>
-            <p>按住说话后松开，结果会自动显示在这里。</p>
+            <button
+              type="button"
+              className="upload-button"
+              onClick={handleUploadButtonClick}
+              aria-label="上传音频文件"
+              title="上传音频文件"
+              disabled={
+                status === "requesting" || status === "recording" || status === "cancel" || status === "uploading"
+              }
+            >
+              文件
+            </button>
           </div>
-        )}
-      </section>
-    </main>
+
+          <button
+            type="button"
+            className="record-button"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerCancel}
+            disabled={status === "requesting" || status === "uploading"}
+          >
+            <span className="record-button-inner">
+              <span className="record-button-title">按住说话</span>
+              <span className="record-button-subtitle">按住录音</span>
+            </span>
+          </button>
+
+          <input
+            ref={fileInputRef}
+            id="audio-upload"
+            className="file-input"
+            type="file"
+            aria-label="上传音频文件"
+            accept=".m4a,.mp3,.wav,.webm,audio/*"
+            onChange={handleFileChange}
+          />
+
+          {error ? <p className="inline-error">{error}</p> : null}
+        </section>
+      </div>
+    </>
   );
 }
