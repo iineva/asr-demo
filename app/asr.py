@@ -12,6 +12,7 @@ from app.utils import normalize_text
 LOGGER = logging.getLogger("asr.model")
 _MODEL_LOCK = Lock()
 _MODEL_INSTANCE = None  # type: Optional["ASRTranscriber"]
+_MYANMAR_SCRIPT_PROMPT = "ကျေးဇူးပြု၍ မြန်မာဘာသာ စာသားကို မြန်မာအက္ခရာဖြင့်သာ ပြန်ရေးပါ။"
 
 
 @dataclass(frozen=True)
@@ -41,9 +42,11 @@ class ASRTranscriber:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
-        kwargs = {"beam_size": 5, "vad_filter": True}
+        kwargs = {"beam_size": 5, "vad_filter": True, "task": "transcribe"}
         if language != "auto":
             kwargs["language"] = language
+        if language == "my":
+            kwargs["initial_prompt"] = _MYANMAR_SCRIPT_PROMPT
 
         segments, info = self.model.transcribe(file_path, **kwargs)
         normalized_segments = []
