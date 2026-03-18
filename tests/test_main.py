@@ -33,6 +33,17 @@ class ApiValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    async def test_legacy_health_endpoint_returns_ok(self) -> None:
+        from app.main import app
+        from httpx import ASGITransport, AsyncClient
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"success": True, "status": "ok"})
+
     async def test_cors_preflight_allows_any_origin_by_default(self) -> None:
         from app.main import app
         from httpx import ASGITransport, AsyncClient

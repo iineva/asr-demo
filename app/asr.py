@@ -3,6 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from time import monotonic
 from threading import Lock
 from typing import Any, Dict, Optional
 
@@ -53,6 +54,7 @@ class ASRTranscriber:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
+        started_at = monotonic()
         settings = get_model_settings()
         kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
         if language != "auto":
@@ -60,7 +62,20 @@ class ASRTranscriber:
         if language == "my":
             kwargs["initial_prompt"] = os.getenv("WHISPER_INITIAL_PROMPT_MY", _DEFAULT_MYANMAR_SCRIPT_PROMPT)
 
+        LOGGER.info(
+            "decode step=start file=%s language=%s device=%s beam=%s vad=%s",
+            file_path,
+            language,
+            self.device,
+            settings.beam_size,
+            settings.vad_filter,
+        )
+        model_started_at = monotonic()
         segments, info = self.model.transcribe(file_path, **kwargs)
+        model_prepare_elapsed_ms = int((monotonic() - model_started_at) * 1000)
+        LOGGER.info("decode step=model_transcribe_ready elapsed_ms=%s", model_prepare_elapsed_ms)
+
+        collect_started_at = monotonic()
         normalized_segments = []
         collected = []
         for segment in segments:
@@ -75,6 +90,14 @@ class ASRTranscriber:
                 }
             )
             collected.append(segment_text)
+        collect_elapsed_ms = int((monotonic() - collect_started_at) * 1000)
+        total_elapsed_ms = int((monotonic() - started_at) * 1000)
+        LOGGER.info(
+            "decode step=segments_collected elapsed_ms=%s total_elapsed_ms=%s segment_count=%s",
+            collect_elapsed_ms,
+            total_elapsed_ms,
+            len(normalized_segments),
+        )
 
         return {
             "requested_language": language,
