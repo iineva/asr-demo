@@ -180,6 +180,7 @@ class StreamingTranscriptionSession:
                 "requested_language": result.get("requested_language", self.language),
                 "segments": result.get("segments", []),
                 "language_probability": result.get("language_probability"),
+                "timing": result.get("timing"),
             },
         )
 

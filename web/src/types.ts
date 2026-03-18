@@ -4,12 +4,19 @@ export type TranscriptSegment = {
   text: string;
 };
 
+export type TranscriptTiming = {
+  convert_ms: number;
+  vad_ms: number;
+  decode_ms: number;
+};
+
 export type TranscriptResult = {
   requested_language: "auto" | "my" | "yue";
   detected_language: string | null;
   language_probability: number;
   text: string;
   segments: TranscriptSegment[];
+  timing?: TranscriptTiming;
 };
 
 export type TranscriptStreamEvent = {
@@ -20,6 +27,7 @@ export type TranscriptStreamEvent = {
     requested_language?: TranscriptResult["requested_language"];
     segments?: TranscriptSegment[];
     language_probability?: number;
+    timing?: TranscriptTiming;
     message?: string;
   } | null;
 };

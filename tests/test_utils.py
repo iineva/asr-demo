@@ -25,6 +25,20 @@ class UtilsContractTests(unittest.TestCase):
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
         self.assertIn("requests", requirements)
 
+    def test_requirements_include_mms_runtime_dependencies(self) -> None:
+        requirements = Path("requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("transformers", requirements)
+        self.assertIn("torchaudio", requirements)
+
+    def test_docker_compose_uses_hf_home_without_deprecated_transformers_cache(self) -> None:
+        compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("HF_HOME:", compose)
+        self.assertNotIn("TRANSFORMERS_CACHE:", compose)
+
+    def test_docker_compose_uses_supported_mms_asr_model(self) -> None:
+        compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("MMS_MODEL_ID: facebook/mms-1b-all", compose)
+
 
 if __name__ == "__main__":
     unittest.main()

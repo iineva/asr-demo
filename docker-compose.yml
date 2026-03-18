@@ -12,7 +12,6 @@ services:
       OUTPUT_DIR: /app/outputs
       XDG_CACHE_HOME: /app/model-cache
       HF_HOME: /app/model-cache/huggingface
-      TRANSFORMERS_CACHE: /app/model-cache/transformers
       MAX_UPLOAD_SIZE_MB: 100
       FFMPEG_TIMEOUT_SECONDS: 300
       TRANSCRIBE_TIMEOUT_SECONDS: 300
@@ -23,6 +22,10 @@ services:
       WHISPER_COMPUTE_TYPE_CUDA: float16
       WHISPER_COMPUTE_TYPE_CPU: int8
       WHISPER_BEAM_SIZE: 1
+      WHISPER_VAD_FILTER: "true"
+      MMS_MODEL_ID: facebook/mms-1b-all
+      MMS_DEVICE: auto
+      MMS_TORCH_DTYPE: float32
       WS_PARTIAL_MIN_BYTES: 131072
       WS_PARTIAL_MIN_INTERVAL_MS: 1200
     volumes:

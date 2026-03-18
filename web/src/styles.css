@@ -269,6 +269,24 @@ select {
   margin: 1rem 0;
 }
 
+.timing-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin: -0.2rem 0 1rem;
+}
+
+.timing-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  background: #efe5d6;
+  color: #68563a;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
 .metric {
   flex: 1;
   display: grid;
@@ -289,7 +307,8 @@ select {
 
 .transcript-card,
 .segment-item,
-.empty-state {
+.empty-state,
+.history-item {
   border-radius: 1.2rem;
   background: #fcfaf5;
   padding: 1rem;

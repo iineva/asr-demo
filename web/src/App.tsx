@@ -4,7 +4,7 @@ import {
   createRecorderSession as defaultCreateRecorderSession,
   type RecorderSession,
 } from "./lib/recorder";
-import type { TranscriptHistoryItem, TranscriptResult, TranscriptSegment, TranscriptStreamEvent } from "./types";
+import type { TranscriptHistoryItem, TranscriptResult, TranscriptSegment, TranscriptStreamEvent, TranscriptTiming } from "./types";
 
 type Props = {
   transcribeAudio?: (blob: Blob, language: string) => Promise<TranscriptResult>;
@@ -29,6 +29,12 @@ type InteractionState =
 const CANCEL_THRESHOLD = 120;
 const REALTIME_COMPLETION_TIMEOUT_MS = 45000;
 
+type PointerPosition = {
+  clientY?: number;
+  pageY?: number;
+  screenY?: number;
+};
+
 function formatProbability(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
@@ -38,6 +44,39 @@ function formatDuration(milliseconds: number): string {
   const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
   const seconds = String(totalSeconds % 60).padStart(2, "0");
   return `${minutes}:${seconds}`;
+}
+
+function formatTiming(milliseconds: number): string {
+  return `${Math.max(0, Math.round(milliseconds))} ms`;
+}
+
+function getPointerY(position: PointerPosition, fallback: number | null): number | null {
+  return (
+    [position.clientY, position.pageY, position.screenY].find((value) => typeof value === "number" && !Number.isNaN(value)) ??
+    fallback
+  );
+}
+
+export function didCrossCancelThreshold(startY: number | null, position: PointerPosition): boolean {
+  if (startY === null) {
+    return false;
+  }
+  const currentY = getPointerY(position, startY);
+  return typeof currentY === "number" && startY - currentY > CANCEL_THRESHOLD;
+}
+
+function renderTimingMetrics(timing?: TranscriptTiming) {
+  if (!timing) {
+    return null;
+  }
+
+  return (
+    <div className="timing-metrics">
+      <span className="timing-pill">转码 {formatTiming(timing.convert_ms)}</span>
+      <span className="timing-pill">VAD {formatTiming(timing.vad_ms)}</span>
+      <span className="timing-pill">识别 {formatTiming(timing.decode_ms)}</span>
+    </div>
+  );
 }
 
 function createDefaultRealtimeSocket(): WebSocket {
@@ -156,6 +195,7 @@ export default function App({
           language_probability: previous?.language_probability ?? 0,
           text: [...finalizedSegments.map((segment) => segment.text.replace(/^__partial__:/, ""))].join(" ").trim(),
           segments: finalizedSegments,
+          timing: previous?.timing,
         };
       }
 
@@ -166,6 +206,7 @@ export default function App({
           language_probability: event.detail?.language_probability ?? 0,
           text: event.text,
           segments: event.detail?.segments ?? nextSegments,
+          timing: event.detail?.timing ?? previous?.timing,
         };
       }
 
@@ -179,6 +220,7 @@ export default function App({
     language_probability: event.detail?.language_probability ?? 0,
     text: event.text,
     segments: event.detail?.segments ?? [],
+    timing: event.detail?.timing ?? undefined,
   });
 
   const resetRealtimeSession = () => {
@@ -356,11 +398,7 @@ export default function App({
       return;
     }
 
-    const currentY =
-      [event.clientY, event.pageY, event.screenY].find((value) => typeof value === "number" && !Number.isNaN(value)) ??
-      startYRef.current;
-    const offset = startYRef.current - currentY;
-    const willCancel = offset > CANCEL_THRESHOLD;
+    const willCancel = didCrossCancelThreshold(startYRef.current, event);
     cancelSlashRef.current = willCancel;
     setStatus(willCancel ? "cancel" : "recording");
   };
@@ -414,7 +452,8 @@ export default function App({
     if ("hasPointerCapture" in event.currentTarget && event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    await finishRecording(status === "cancel");
+    const shouldCancelOnRelease = didCrossCancelThreshold(startYRef.current, event);
+    await finishRecording(status === "cancel" || shouldCancelOnRelease);
   };
 
   const handlePointerCancel = async () => {
@@ -487,6 +526,8 @@ export default function App({
                 </div>
               </div>
 
+              {renderTimingMetrics(latestResult.timing)}
+
               <article className="transcript-card">
                 <p>{latestResult.text}</p>
               </article>
@@ -515,6 +556,7 @@ export default function App({
                         <span className="history-stamp">
                           {new Date(item.createdAt).toLocaleTimeString()}
                         </span>
+                        {renderTimingMetrics(item.result.timing)}
                         <p>{item.result.text}</p>
                         <audio controls src={item.audioUrl} />
                       </article>

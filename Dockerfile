@@ -15,7 +15,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WHISPER_DEVICE=auto \
     WHISPER_COMPUTE_TYPE_CUDA=float16 \
     WHISPER_COMPUTE_TYPE_CPU=int8 \
-    WHISPER_BEAM_SIZE=1
+    WHISPER_BEAM_SIZE=1 \
+    MMS_MODEL_ID=facebook/mms-1b-all \
+    MMS_DEVICE=auto \
+    MMS_TORCH_DTYPE=float32
 
 WORKDIR /app
 

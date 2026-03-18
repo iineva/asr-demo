@@ -13,7 +13,7 @@ from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.asr import get_transcriber, transcribe_audio
+from app.asr import get_whisper_transcriber, transcribe_audio
 from app.streaming import (
     StreamingTranscriptionSession,
     append_bytes,
@@ -62,6 +62,16 @@ configure_logging()
 LOGGER = logging.getLogger("asr.api")
 
 
+def attach_timing(result: Dict[str, Any], *, convert_ms: int, decode_ms: int) -> Dict[str, Any]:
+    timing = dict(result.get("timing") or {})
+    timing["convert_ms"] = convert_ms
+    timing["vad_ms"] = int(timing.get("vad_ms") or 0)
+    timing["decode_ms"] = decode_ms
+    enriched = dict(result)
+    enriched["timing"] = timing
+    return enriched
+
+
 def get_settings() -> Dict[str, Any]:
     return {
         "service_name": os.getenv("SERVICE_NAME", "asr-service"),
@@ -88,7 +98,7 @@ async def lifespan(_: FastAPI):
     ensure_directory(settings["output_dir"])
     if settings["preload_model"]:
         try:
-            await asyncio.to_thread(get_transcriber)
+            await asyncio.to_thread(get_whisper_transcriber)
         except Exception:
             LOGGER.exception("model preload failed")
     yield
@@ -119,7 +129,7 @@ async def health() -> Dict[str, Any]:
 @api_router.get("/ready")
 async def ready() -> JSONResponse:
     try:
-        await asyncio.to_thread(get_transcriber)
+        await asyncio.to_thread(get_whisper_transcriber)
     except Exception as exc:
         return JSONResponse(status_code=503, content={"success": False, "status": "degraded", "detail": str(exc)})
     return JSONResponse(status_code=200, content={"success": True, "status": "ready"})
@@ -176,6 +186,7 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
             timeout=settings["transcribe_timeout_seconds"],
         )
         transcribe_elapsed_ms = int((monotonic() - decode_started_at) * 1000)
+        result = attach_timing(result, convert_ms=convert_elapsed_ms, decode_ms=transcribe_elapsed_ms)
         last_step = "decode_done"
         LOGGER.info(
             "transcribe request_id=%s step=decode_done elapsed_ms=%s text_len=%s",
@@ -279,10 +290,15 @@ async def transcribe_stream(file: UploadFile = File(...), language: str = Form("
             transcribe_audio(str(wav_path), requested_language),
             timeout=settings["transcribe_timeout_seconds"],
         )
+        result = attach_timing(
+            result,
+            convert_ms=int((monotonic() - convert_started_at) * 1000),
+            decode_ms=int((monotonic() - decode_started_at) * 1000),
+        )
         LOGGER.info(
             "transcribe_stream request_id=%s step=decode_done elapsed_ms=%s text_len=%s total_elapsed_ms=%s",
             request_id,
-            int((monotonic() - decode_started_at) * 1000),
+            result["timing"]["decode_ms"],
             len(result.get("text", "")),
             int((monotonic() - stream_started_at) * 1000),
         )
@@ -396,10 +412,15 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                         transcribe_audio(str(wav_path), requested_language),
                         timeout=settings["transcribe_timeout_seconds"],
                     )
+                    result = attach_timing(
+                        result,
+                        convert_ms=int((monotonic() - convert_started_at) * 1000),
+                        decode_ms=int((monotonic() - decode_started_at) * 1000),
+                    )
                     LOGGER.info(
                         "ws_transcribe step=final_decode_done session_id=%s elapsed_ms=%s text_len=%s",
                         session.session_id,
-                        int((monotonic() - decode_started_at) * 1000),
+                        result["timing"]["decode_ms"],
                         len(result.get("text", "")),
                     )
                     final_segments = result.get("segments", [])

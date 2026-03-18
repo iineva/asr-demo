@@ -16,6 +16,7 @@ describe("transcribeAudio", () => {
               requested_language: "auto",
               language_probability: 0.9,
               segments: [],
+              timing: { convert_ms: 120, vad_ms: 30, decode_ms: 450 },
             },
           }),
         ].join("\n"),
@@ -25,7 +26,8 @@ describe("transcribeAudio", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     try {
-      await transcribeAudio(new Blob(["audio"], { type: "audio/webm" }), "auto");
+      const result = await transcribeAudio(new Blob(["audio"], { type: "audio/webm" }), "auto");
+      expect(result.timing).toEqual({ convert_ms: 120, vad_ms: 30, decode_ms: 450 });
     } finally {
       vi.unstubAllGlobals();
     }
@@ -52,6 +54,7 @@ describe("transcribeAudio", () => {
             requested_language: "auto",
             language_probability: 0.9,
             segments: [],
+            timing: { convert_ms: 50, vad_ms: 10, decode_ms: 120 },
           },
         }),
       ),
@@ -90,6 +93,7 @@ describe("transcribeAudio", () => {
             language_probability: 0.9,
             text: "fallback result",
             segments: [],
+            timing: { convert_ms: 80, vad_ms: 20, decode_ms: 300 },
           },
         }),
       });
@@ -99,6 +103,7 @@ describe("transcribeAudio", () => {
     try {
       const result = await transcribeAudio(new Blob(["audio"], { type: "audio/webm" }), "auto");
       expect(result.text).toBe("fallback result");
+      expect(result.timing).toEqual({ convert_ms: 80, vad_ms: 20, decode_ms: 300 });
     } finally {
       vi.unstubAllGlobals();
     }

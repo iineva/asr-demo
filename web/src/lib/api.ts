@@ -51,6 +51,7 @@ function buildTranscriptResultFromEvent(
     language_probability: event.detail?.language_probability ?? 0,
     text: event.text,
     segments,
+    timing: event.detail?.timing ?? undefined,
   };
 }
 

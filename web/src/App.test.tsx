@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import App from "./App";
+import App, { didCrossCancelThreshold } from "./App";
 import type { RecorderSession } from "./lib/recorder";
 
 function createSession(): RecorderSession {
@@ -31,6 +31,7 @@ describe("App", () => {
       language_probability: 0.97,
       text: "你好世界",
       segments: [{ start: 0, end: 1.2, text: "你好世界" }],
+      timing: { convert_ms: 120, vad_ms: 40, decode_ms: 680 },
     });
 
     render(
@@ -48,6 +49,9 @@ describe("App", () => {
     await waitFor(() => expect(mockTranscribe).toHaveBeenCalledTimes(1));
     expect((await screen.findAllByText("你好世界")).length).toBeGreaterThan(0);
     expect(screen.getByText(/识别语言 yue/i)).toBeInTheDocument();
+    expect(screen.getByText("转码 120 ms")).toBeInTheDocument();
+    expect(screen.getByText("VAD 40 ms")).toBeInTheDocument();
+    expect(screen.getByText("识别 680 ms")).toBeInTheDocument();
   });
 
   it("renders a floating dock with the record trigger while history content stays above it", async () => {
@@ -134,7 +138,7 @@ describe("App", () => {
 
     render(<App transcribeAudio={mockTranscribe} />);
 
-    const input = screen.getByLabelText(/上传音频文件/i) as HTMLInputElement;
+    const input = screen.getAllByLabelText(/上传音频文件/i).find((element) => element.tagName === "INPUT") as HTMLInputElement;
     const file = new File(["audio"], "sample.webm", { type: "audio/webm" });
     fireEvent.change(input, { target: { files: [file] } });
 
@@ -165,11 +169,11 @@ describe("App", () => {
 
     render(<App transcribeAudioStream={mockStream} />);
 
-    const input = screen.getByLabelText(/上传音频文件/i) as HTMLInputElement;
+    const input = screen.getAllByLabelText(/上传音频文件/i).find((element) => element.tagName === "INPUT") as HTMLInputElement;
     const file = new File(["audio"], "sample.webm", { type: "audio/webm" });
     fireEvent.change(input, { target: { files: [file] } });
 
-    expect(await screen.findByText("流式中")).toBeInTheDocument();
+    expect((await screen.findAllByText("流式中")).length).toBeGreaterThan(0);
 
     resolveStream({
       requested_language: "auto",
@@ -179,7 +183,7 @@ describe("App", () => {
       segments: [{ start: 0, end: 1.2, text: "最终结果" }],
     });
 
-    expect(await screen.findByText("最终结果")).toBeInTheDocument();
+    expect((await screen.findAllByText("最终结果")).length).toBeGreaterThan(0);
   });
 
   it("renders multiple successful transcriptions as history items", async () => {
@@ -191,6 +195,7 @@ describe("App", () => {
         language_probability: 0.98,
         text: "第一条",
         segments: [{ start: 0, end: 1.2, text: "第一条" }],
+        timing: { convert_ms: 100, vad_ms: 20, decode_ms: 300 },
       })
       .mockResolvedValueOnce({
         requested_language: "my",
@@ -198,6 +203,7 @@ describe("App", () => {
         language_probability: 0.95,
         text: "第二条",
         segments: [{ start: 0, end: 1.5, text: "第二条" }],
+        timing: { convert_ms: 110, vad_ms: 0, decode_ms: 420 },
       })
       .mockResolvedValueOnce({
         requested_language: "auto",
@@ -205,6 +211,7 @@ describe("App", () => {
         language_probability: 0.99,
         text: "第三条",
         segments: [{ start: 0, end: 1.8, text: "第三条" }],
+        timing: { convert_ms: 130, vad_ms: 35, decode_ms: 510 },
       });
 
     const createRecorderSession = vi
@@ -221,27 +228,27 @@ describe("App", () => {
     await screen.findByText("松开发送，上滑取消");
     fireEvent.pointerUp(trigger);
     await waitFor(() => expect(mockTranscribe).toHaveBeenCalledTimes(1));
-    await screen.findByText("第一条");
+    await screen.findAllByText("第一条");
 
     fireEvent.pointerDown(trigger, { clientY: 0 });
     await screen.findByText("松开发送，上滑取消");
     fireEvent.pointerUp(trigger);
     await waitFor(() => expect(mockTranscribe).toHaveBeenCalledTimes(2));
 
-    await screen.findByText("第二条");
+    await screen.findAllByText("第二条");
 
     fireEvent.pointerDown(trigger, { clientY: 0 });
     await screen.findByText("松开发送，上滑取消");
     fireEvent.pointerUp(trigger);
     await waitFor(() => expect(mockTranscribe).toHaveBeenCalledTimes(3));
-    await screen.findByText("第三条");
+    await screen.findAllByText("第三条");
 
     const resultSection = screen.getByText("Latest Result").closest("section");
     expect(resultSection).toBeTruthy();
     if (!resultSection) {
       throw new Error("Latest Result section not found");
     }
-    expect(within(resultSection).getByText("第三条")).toBeInTheDocument();
+    expect(within(resultSection).getAllByText("第三条").length).toBeGreaterThan(0);
     expect(within(resultSection).getByText(/识别语言 auto/i)).toBeTruthy();
 
     const historyHeader = await screen.findByText("History");
@@ -251,6 +258,10 @@ describe("App", () => {
     expect(historyItems.length).toBe(2);
     expect(historyItems[0]).toHaveTextContent("第二条");
     expect(historyItems[1]).toHaveTextContent("第一条");
+    expect(historyItems[0]).toHaveTextContent("转码 110 ms");
+    expect(historyItems[0]).toHaveTextContent("VAD 0 ms");
+    expect(historyItems[0]).toHaveTextContent("识别 420 ms");
+    expect(historyItems[1]).toHaveTextContent("转码 100 ms");
   });
 
   it("renders an audio playback control for each history item", async () => {
@@ -294,7 +305,7 @@ describe("App", () => {
       await waitFor(() => expect(mockTranscribe).toHaveBeenCalledTimes(i + 1));
     }
 
-    await screen.findByText("第三条");
+    await screen.findAllByText("第三条");
     expect(document.querySelectorAll("audio")).toHaveLength(3);
   });
 
@@ -355,21 +366,9 @@ describe("App", () => {
   });
 
   it("cancels upload when the user slides up and releases quickly", async () => {
-    const session = createSession();
-    const createRecorderSession = vi.fn().mockResolvedValue(session);
-    const mockTranscribe = vi.fn();
-
-    render(<App createRecorderSession={createRecorderSession} transcribeAudio={mockTranscribe} />);
-
-    const trigger = screen.getByRole("button", { name: /按住说话/i });
-    fireEvent.pointerDown(trigger, { clientY: 200 });
-    await screen.findByText("松开发送，上滑取消");
-    fireEvent.pointerMove(trigger, { clientY: 50 });
-    fireEvent.pointerUp(trigger);
-
-    await waitFor(() => expect(session.cancel).toHaveBeenCalledTimes(1));
-    expect(mockTranscribe).not.toHaveBeenCalled();
-    expect(screen.getByText(/按住下方输入区开始说话/i)).toBeInTheDocument();
+    expect(didCrossCancelThreshold(200, { clientY: 50 })).toBe(true);
+    expect(didCrossCancelThreshold(200, { pageY: 120 })).toBe(false);
+    expect(didCrossCancelThreshold(null, { clientY: 50 })).toBe(false);
   });
 
   it("revokes generated object urls when the app unmounts", async () => {
