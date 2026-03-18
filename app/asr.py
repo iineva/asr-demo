@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import tempfile
 import wave
 from dataclasses import dataclass
 from functools import lru_cache
@@ -168,30 +167,31 @@ class ASRTranscriber:
     def _detect_language_sync(self, file_path: str) -> Dict[str, Any]:
         settings = get_model_settings()
         detect_seconds = max(1.0, float(os.getenv("WHISPER_LANGUAGE_DETECT_SECONDS", "3.0")))
-        preview_path = _create_preview_wav(file_path, detect_seconds)
+        preview_audio = _load_preview_audio(file_path, detect_seconds)
         started_at = monotonic()
-        LOGGER.info("detect_language step=start file=%s preview=%s duration_s=%s", file_path, preview_path, detect_seconds)
-        try:
-            _segments, info = self.model.transcribe(
-                preview_path,
-                beam_size=1,
-                vad_filter=settings.vad_filter,
-                task="transcribe",
-            )
-            result = {
-                "language": getattr(info, "language", None),
-                "language_probability": round(float(getattr(info, "language_probability", 0.0)), 4),
-            }
-            LOGGER.info(
-                "detect_language step=done elapsed_ms=%s language=%s probability=%s",
-                int((monotonic() - started_at) * 1000),
-                result["language"],
-                result["language_probability"],
-            )
-            return result
-        finally:
-            if preview_path != file_path and os.path.exists(preview_path):
-                os.remove(preview_path)
+        LOGGER.info(
+            "detect_language step=start file=%s preview_source=%s duration_s=%s",
+            file_path,
+            "memory" if preview_audio is not file_path else "path",
+            detect_seconds,
+        )
+        _segments, info = self.model.transcribe(
+            preview_audio,
+            beam_size=1,
+            vad_filter=settings.vad_filter,
+            task="transcribe",
+        )
+        result = {
+            "language": getattr(info, "language", None),
+            "language_probability": round(float(getattr(info, "language_probability", 0.0)), 4),
+        }
+        LOGGER.info(
+            "detect_language step=done elapsed_ms=%s language=%s probability=%s",
+            int((monotonic() - started_at) * 1000),
+            result["language"],
+            result["language_probability"],
+        )
+        return result
 
     def _build_transcribe_kwargs(self, language: str, settings: ModelSettings) -> Dict[str, Any]:
         kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
@@ -377,28 +377,41 @@ def _get_audio_duration_seconds(file_path: str) -> float:
     return frame_count / frame_rate
 
 
-def _create_preview_wav(file_path: str, max_seconds: float) -> str:
-    with wave.open(file_path, "rb") as source:
-        frame_rate = source.getframerate()
-        if frame_rate <= 0:
+def _load_preview_audio(file_path: str, max_seconds: float) -> Any:
+    try:
+        import numpy as np
+
+        with wave.open(file_path, "rb") as source:
+            frame_rate = source.getframerate()
+            total_frames = source.getnframes()
+            if frame_rate <= 0 or total_frames <= 0:
+                return file_path
+
+            preview_frames = min(total_frames, int(frame_rate * max_seconds))
+            if preview_frames <= 0 or preview_frames >= total_frames:
+                return file_path
+
+            sample_width = source.getsampwidth()
+            channel_count = source.getnchannels()
+            raw_audio = source.readframes(preview_frames)
+
+        if sample_width == 1:
+            audio = np.frombuffer(raw_audio, dtype=np.uint8).astype(np.float32)
+            audio = (audio - 128.0) / 128.0
+        elif sample_width == 2:
+            audio = np.frombuffer(raw_audio, dtype="<i2").astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            audio = np.frombuffer(raw_audio, dtype="<i4").astype(np.float32) / 2147483648.0
+        else:
             return file_path
-        preview_frames = min(source.getnframes(), int(frame_rate * max_seconds))
-        if preview_frames <= 0 or preview_frames >= source.getnframes():
-            return file_path
-        preview_audio = source.readframes(preview_frames)
-        sample_width = source.getsampwidth()
-        channel_count = source.getnchannels()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as preview_file:
-        preview_path = preview_file.name
+        if channel_count > 1:
+            audio = audio.reshape(-1, channel_count).mean(axis=1)
 
-    with wave.open(preview_path, "wb") as target:
-        target.setnchannels(channel_count)
-        target.setsampwidth(sample_width)
-        target.setframerate(frame_rate)
-        target.writeframes(preview_audio)
-
-    return preview_path
+        return np.ascontiguousarray(audio, dtype=np.float32)
+    except Exception:
+        LOGGER.exception("detect_language step=preview_audio_fallback file=%s", file_path)
+        return file_path
 
 
 def _apply_mms_vad(waveform: Any, sample_rate: int) -> tuple[Any, int]:

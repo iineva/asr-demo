@@ -1,5 +1,8 @@
 import asyncio
+import os
+import tempfile
 import unittest
+import wave
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
@@ -16,6 +19,17 @@ class DummyModel:
         segments = [SimpleNamespace(start=0.0, end=1.0, text=" မင်္ဂလာပါ ")]
         info = SimpleNamespace(language="my", language_probability=0.99)
         return segments, info
+
+
+class DetectLanguageRecordingModel:
+    def __init__(self) -> None:
+        self.audio_inputs = []
+        self.last_kwargs = None
+
+    def transcribe(self, audio_input, **kwargs):
+        self.audio_inputs.append(audio_input)
+        self.last_kwargs = kwargs
+        return [], SimpleNamespace(language="yue", language_probability=0.88)
 
 
 class MyanmarAutoRetryModel:
@@ -195,6 +209,31 @@ class AsrTranscriberTests(unittest.TestCase):
                 "removed_silence_ms": 3500,
             },
         )
+
+    def test_detect_language_uses_in_memory_preview_audio_for_wav(self) -> None:
+        model = DetectLanguageRecordingModel()
+        transcriber = ASRTranscriber(model=model, device="cpu")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
+            file_path = audio_file.name
+
+        try:
+            with wave.open(file_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 16000 * 2)
+
+            with patch.dict("os.environ", {"WHISPER_LANGUAGE_DETECT_SECONDS": "1.0"}, clear=False):
+                result = transcriber._detect_language_sync(file_path)
+
+            self.assertEqual(result["language"], "yue")
+            self.assertEqual(result["language_probability"], 0.88)
+            self.assertEqual(model.last_kwargs["task"], "transcribe")
+            self.assertNotIsInstance(model.audio_inputs[0], str)
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
     def test_transcriber_router_routes_explicit_myanmar_to_mms(self) -> None:
         whisper = RecordingAsyncTranscriber({"engine": "whisper"})

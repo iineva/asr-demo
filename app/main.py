@@ -72,6 +72,70 @@ def attach_timing(result: Dict[str, Any], *, convert_ms: int, decode_ms: int) ->
     return enriched
 
 
+async def run_transcription_with_lazy_conversion(
+    source_path: Path,
+    requested_language: str,
+    settings: Dict[str, Any],
+) -> tuple[Dict[str, Any], int, Optional[Path]]:
+    if requested_language == "my":
+        convert_started_at = monotonic()
+        wav_path = await convert_audio_to_wav(
+            str(source_path),
+            settings["output_dir"],
+            settings["ffmpeg_timeout_seconds"],
+        )
+        convert_elapsed_ms = int((monotonic() - convert_started_at) * 1000)
+        result = await asyncio.wait_for(
+            transcribe_audio(str(wav_path), requested_language),
+            timeout=settings["transcribe_timeout_seconds"],
+        )
+        return result, convert_elapsed_ms, wav_path
+
+    if requested_language != "auto":
+        result = await asyncio.wait_for(
+            transcribe_audio(str(source_path), requested_language),
+            timeout=settings["transcribe_timeout_seconds"],
+        )
+        return result, 0, None
+
+    whisper_transcriber = await asyncio.to_thread(get_whisper_transcriber)
+    detection = await whisper_transcriber.detect_language(str(source_path))
+    detected_language = detection.get("language")
+    detected_probability = detection.get("language_probability", 0.0)
+
+    if detected_language == "my":
+        convert_started_at = monotonic()
+        wav_path = await convert_audio_to_wav(
+            str(source_path),
+            settings["output_dir"],
+            settings["ffmpeg_timeout_seconds"],
+        )
+        convert_elapsed_ms = int((monotonic() - convert_started_at) * 1000)
+        mms_result = await asyncio.wait_for(
+            transcribe_audio(str(wav_path), "my"),
+            timeout=settings["transcribe_timeout_seconds"],
+        )
+        rerouted_result = dict(mms_result)
+        rerouted_result["requested_language"] = "auto"
+        rerouted_result["detected_language"] = "my"
+        rerouted_result["language_probability"] = detected_probability
+        return rerouted_result, convert_elapsed_ms, wav_path
+
+    whisper_language = detected_language or "auto"
+    whisper_result = await asyncio.wait_for(
+        whisper_transcriber.transcribe(str(source_path), whisper_language),
+        timeout=settings["transcribe_timeout_seconds"],
+    )
+    if detected_language is None:
+        return whisper_result, 0, None
+
+    rerouted_result = dict(whisper_result)
+    rerouted_result["requested_language"] = "auto"
+    rerouted_result["detected_language"] = detected_language
+    rerouted_result["language_probability"] = detected_probability
+    return rerouted_result, 0, None
+
+
 def get_settings() -> Dict[str, Any]:
     return {
         "service_name": os.getenv("SERVICE_NAME", "asr-service"),
@@ -167,27 +231,23 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
             source_path,
             source_path.stat().st_size if source_path.exists() else 0,
         )
-        convert_started_at = monotonic()
-        last_step = "convert_start"
-        LOGGER.info("transcribe request_id=%s step=convert_start source=%s", request_id, source_path)
-        wav_path = await convert_audio_to_wav(
-            str(source_path),
-            settings["output_dir"],
-            settings["ffmpeg_timeout_seconds"],
-        )
-        convert_elapsed_ms = int((monotonic() - convert_started_at) * 1000)
-        last_step = "convert_done"
-        LOGGER.info("transcribe request_id=%s step=convert_done elapsed_ms=%s wav=%s", request_id, convert_elapsed_ms, wav_path)
         decode_started_at = monotonic()
         last_step = "decode_start"
-        LOGGER.info("transcribe request_id=%s step=decode_start wav=%s", request_id, wav_path)
-        result = await asyncio.wait_for(
-            transcribe_audio(str(wav_path), requested_language),
-            timeout=settings["transcribe_timeout_seconds"],
+        LOGGER.info("transcribe request_id=%s step=decode_start source=%s language=%s", request_id, source_path, requested_language)
+        result, convert_elapsed_ms, wav_path = await run_transcription_with_lazy_conversion(
+            source_path,
+            requested_language,
+            settings,
         )
         transcribe_elapsed_ms = int((monotonic() - decode_started_at) * 1000)
         result = attach_timing(result, convert_ms=convert_elapsed_ms, decode_ms=transcribe_elapsed_ms)
         last_step = "decode_done"
+        LOGGER.info(
+            "transcribe request_id=%s step=conversion_summary convert_elapsed_ms=%s wav=%s",
+            request_id,
+            convert_elapsed_ms,
+            wav_path,
+        )
         LOGGER.info(
             "transcribe request_id=%s step=decode_done elapsed_ms=%s text_len=%s",
             request_id,
