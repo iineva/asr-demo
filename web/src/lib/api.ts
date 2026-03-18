@@ -1,6 +1,22 @@
 import type { TranscriptResult, TranscriptStreamEvent } from "../types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api";
+const TRANSCRIBE_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TRANSCRIBE_REQUEST_TIMEOUT_MS ?? "180000");
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = TRANSCRIBE_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("识别请求超时，请稍后重试");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
 
 function inferUploadFilename(file: Blob): string {
   const normalizedType = file.type.toLowerCase();
@@ -108,7 +124,7 @@ async function postLegacyTranscription(uploadFile: File, language: string): Prom
   formData.append("file", uploadFile);
   formData.append("language", language);
 
-  const response = await fetch(`${API_BASE_URL}/transcribe`, {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/transcribe`, {
     method: "POST",
     body: formData,
   });
@@ -135,7 +151,7 @@ export async function transcribeAudioStream(
   formData.append("file", uploadFile);
   formData.append("language", language);
 
-  const response = await fetch(`${API_BASE_URL}/transcribe/stream`, {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/transcribe/stream`, {
     method: "POST",
     body: formData,
   });

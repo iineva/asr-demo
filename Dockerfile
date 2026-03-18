@@ -9,12 +9,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OUTPUT_DIR=/app/outputs \
     MAX_UPLOAD_SIZE_MB=100 \
     FFMPEG_TIMEOUT_SECONDS=300 \
-    TRANSCRIBE_TIMEOUT_SECONDS=1800 \
+    TRANSCRIBE_TIMEOUT_SECONDS=300 \
     PRELOAD_MODEL_ON_STARTUP=false \
-    WHISPER_MODEL_SIZE=large-v3 \
+    WHISPER_MODEL_SIZE=medium \
     WHISPER_DEVICE=auto \
     WHISPER_COMPUTE_TYPE_CUDA=float16 \
-    WHISPER_COMPUTE_TYPE_CPU=int8
+    WHISPER_COMPUTE_TYPE_CPU=int8 \
+    WHISPER_BEAM_SIZE=1
 
 WORKDIR /app
 
@@ -40,6 +41,6 @@ USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
 
 CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

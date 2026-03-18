@@ -3,6 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from time import monotonic
 from threading import Lock
 from typing import Any, Dict, Optional
 
@@ -13,6 +14,7 @@ LOGGER = logging.getLogger("asr.model")
 _MODEL_LOCK = Lock()
 _MODEL_INSTANCE = None  # type: Optional["ASRTranscriber"]
 _DEFAULT_MYANMAR_SCRIPT_PROMPT = "ကျေးဇူးပြု၍ မြန်မာဘာသာ စာသားကို မြန်မာအက္ခရာဖြင့်သာ ပြန်ရေးပါ။"
+_CPU_SLOW_MODEL_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -32,14 +34,34 @@ def _read_bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_model_size() -> str:
+    configured_model_size = os.getenv("WHISPER_MODEL_SIZE")
+    if configured_model_size:
+        return configured_model_size
+
+    default_model_size = "large-v3"
+    cpu_default_model_size = os.getenv("WHISPER_MODEL_SIZE_CPU_DEFAULT", "medium")
+    if _is_cuda_available():
+        return default_model_size
+    return cpu_default_model_size
+
+
 @lru_cache(maxsize=1)
 def get_model_settings() -> ModelSettings:
+    global _CPU_SLOW_MODEL_WARNED
+    model_size = _resolve_model_size()
+    if not _is_cuda_available() and model_size == "large-v3" and not _CPU_SLOW_MODEL_WARNED:
+        LOGGER.warning(
+            "running large-v3 on cpu may be very slow; consider WHISPER_MODEL_SIZE=medium or small for faster responses"
+        )
+        _CPU_SLOW_MODEL_WARNED = True
+
     return ModelSettings(
-        model_size=os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
+        model_size=model_size,
         device_preference=os.getenv("WHISPER_DEVICE", "auto").lower(),
         cuda_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CUDA", "float16"),
         cpu_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CPU", "int8"),
-        beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "5"))),
+        beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "2"))),
         vad_filter=_read_bool_env("WHISPER_VAD_FILTER", True),
     )
 
@@ -53,6 +75,7 @@ class ASRTranscriber:
         return await asyncio.to_thread(self._transcribe_sync, file_path, language)
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
+        started_at = monotonic()
         settings = get_model_settings()
         kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
         if language != "auto":
@@ -60,7 +83,20 @@ class ASRTranscriber:
         if language == "my":
             kwargs["initial_prompt"] = os.getenv("WHISPER_INITIAL_PROMPT_MY", _DEFAULT_MYANMAR_SCRIPT_PROMPT)
 
+        LOGGER.info(
+            "decode step=start file=%s language=%s device=%s beam=%s vad=%s",
+            file_path,
+            language,
+            self.device,
+            settings.beam_size,
+            settings.vad_filter,
+        )
+        model_started_at = monotonic()
         segments, info = self.model.transcribe(file_path, **kwargs)
+        model_prepare_elapsed_ms = int((monotonic() - model_started_at) * 1000)
+        LOGGER.info("decode step=model_transcribe_ready elapsed_ms=%s", model_prepare_elapsed_ms)
+
+        collect_started_at = monotonic()
         normalized_segments = []
         collected = []
         for segment in segments:
@@ -75,6 +111,14 @@ class ASRTranscriber:
                 }
             )
             collected.append(segment_text)
+        collect_elapsed_ms = int((monotonic() - collect_started_at) * 1000)
+        total_elapsed_ms = int((monotonic() - started_at) * 1000)
+        LOGGER.info(
+            "decode step=segments_collected elapsed_ms=%s total_elapsed_ms=%s segment_count=%s",
+            collect_elapsed_ms,
+            total_elapsed_ms,
+            len(normalized_segments),
+        )
 
         return {
             "requested_language": language,
