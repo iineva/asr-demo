@@ -12,6 +12,7 @@ from app.utils import normalize_text
 LOGGER = logging.getLogger("asr.model")
 _MODEL_LOCK = Lock()
 _MODEL_INSTANCE = None  # type: Optional["ASRTranscriber"]
+_DEFAULT_MYANMAR_SCRIPT_PROMPT = "ကျေးဇူးပြု၍ မြန်မာဘာသာ စာသားကို မြန်မာအက္ခရာဖြင့်သာ ပြန်ရေးပါ။"
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,13 @@ class ModelSettings:
     vad_filter: bool
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @lru_cache(maxsize=1)
 def get_model_settings() -> ModelSettings:
     return ModelSettings(
@@ -32,7 +40,7 @@ def get_model_settings() -> ModelSettings:
         cuda_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CUDA", "float16"),
         cpu_compute_type=os.getenv("WHISPER_COMPUTE_TYPE_CPU", "int8"),
         beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "5"))),
-        vad_filter=os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true",
+        vad_filter=_read_bool_env("WHISPER_VAD_FILTER", True),
     )
 
 
@@ -46,9 +54,11 @@ class ASRTranscriber:
 
     def _transcribe_sync(self, file_path: str, language: str) -> Dict[str, Any]:
         settings = get_model_settings()
-        kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter}
+        kwargs = {"beam_size": settings.beam_size, "vad_filter": settings.vad_filter, "task": "transcribe"}
         if language != "auto":
             kwargs["language"] = language
+        if language == "my":
+            kwargs["initial_prompt"] = os.getenv("WHISPER_INITIAL_PROMPT_MY", _DEFAULT_MYANMAR_SCRIPT_PROMPT)
 
         segments, info = self.model.transcribe(file_path, **kwargs)
         normalized_segments = []
