@@ -70,15 +70,14 @@ async def save_upload_file(upload_file: Any, destination_dir: str, max_size_byte
     return destination
 
 
-def _run_ffmpeg(input_path: str, output_path: str, timeout_seconds: int) -> None:
+def _run_ffmpeg(input_path: str, output_path: str, timeout_seconds: int, tail_seconds: Optional[int] = None) -> None:
     import ffmpeg
 
     try:
-        (
-            ffmpeg.input(input_path)
-            .output(output_path, ar=16000, ac=1, format="wav")
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True, quiet=True, cmd=["ffmpeg"])
+        ffmpeg_input_kwargs = {"sseof": -int(tail_seconds)} if tail_seconds and tail_seconds > 0 else {}
+        stream = ffmpeg.input(input_path, **ffmpeg_input_kwargs)
+        stream.output(output_path, ar=16000, ac=1, format="wav").overwrite_output().run(
+            capture_stdout=True, capture_stderr=True, quiet=True, cmd=["ffmpeg"]
         )
     except ffmpeg.Error as exc:
         stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
@@ -86,12 +85,18 @@ def _run_ffmpeg(input_path: str, output_path: str, timeout_seconds: int) -> None
         raise FFmpegError(stderr or "ffmpeg preprocessing failed") from exc
 
 
-async def convert_audio_to_wav(input_path: str, output_dir: str, timeout_seconds: int) -> Path:
+async def convert_audio_to_wav(
+    input_path: str,
+    output_dir: str,
+    timeout_seconds: int,
+    *,
+    tail_seconds: Optional[int] = None,
+) -> Path:
     ensure_directory(output_dir)
     output_path = Path(output_dir) / f"{Path(input_path).stem}.wav"
     try:
         await asyncio.wait_for(
-            asyncio.to_thread(_run_ffmpeg, input_path, str(output_path), timeout_seconds),
+            asyncio.to_thread(_run_ffmpeg, input_path, str(output_path), timeout_seconds, tail_seconds),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError as exc:

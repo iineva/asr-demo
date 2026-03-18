@@ -212,3 +212,8 @@ async def iter_file_upload_events(
 
 def write_bytes(path: Path, payload: bytearray) -> None:
     path.write_bytes(bytes(payload))
+
+
+def append_bytes(path: Path, payload: bytes) -> None:
+    with path.open("ab") as handle:
+        handle.write(payload)
