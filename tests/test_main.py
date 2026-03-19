@@ -1,10 +1,80 @@
 import asyncio
 import unittest
 from pathlib import Path
+import tempfile
+import wave
 from unittest.mock import AsyncMock, patch
 
 
 class MainHelpersTests(unittest.TestCase):
+    def test_is_pcm_stream_detects_pcm_mime(self) -> None:
+        from app import main
+
+        self.assertTrue(main.is_pcm_stream("audio/pcm"))
+        self.assertTrue(main.is_pcm_stream("audio/L16"))
+        self.assertFalse(main.is_pcm_stream("audio/webm"))
+
+    def test_is_opus_stream_detects_opus_container_mime(self) -> None:
+        from app import main
+
+        self.assertTrue(main.is_opus_stream("audio/webm;codecs=opus"))
+        self.assertTrue(main.is_opus_stream("audio/ogg;codecs=opus"))
+        self.assertFalse(main.is_opus_stream("audio/wav"))
+
+    def test_write_pcm16le_wav_creates_valid_wave_file(self) -> None:
+        from app import main
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = Path(tmp.name)
+
+        try:
+            pcm_payload = b"\x00\x00" * 320
+            main.write_pcm16le_wav(
+                target_path=wav_path,
+                pcm_payload=pcm_payload,
+                sample_rate=16000,
+                channels=1,
+                bytes_per_sample=2,
+            )
+
+            with wave.open(str(wav_path), "rb") as wav_file:
+                self.assertEqual(wav_file.getframerate(), 16000)
+                self.assertEqual(wav_file.getnchannels(), 1)
+                self.assertEqual(wav_file.getsampwidth(), 2)
+                self.assertEqual(wav_file.readframes(wav_file.getnframes()), pcm_payload)
+        finally:
+            wav_path.unlink(missing_ok=True)
+
+    def test_get_settings_uses_20ms_chunk_defaults_for_low_latency_partial_decode(self) -> None:
+        from app import main
+
+        with patch.dict("os.environ", {}, clear=True):
+            settings = main.get_settings()
+
+        self.assertEqual(settings["ws_chunk_ms"], 20)
+        self.assertEqual(settings["ws_chunk_bytes"], 640)
+        self.assertEqual(settings["ws_partial_min_bytes"], 640)
+        self.assertEqual(settings["ws_partial_min_interval_ms"], 20)
+
+    def test_get_settings_supports_custom_chunk_parameters(self) -> None:
+        from app import main
+
+        with patch.dict(
+            "os.environ",
+            {
+                "WS_CHUNK_MS": "40",
+                "WS_AUDIO_SAMPLE_RATE": "16000",
+                "WS_AUDIO_CHANNELS": "1",
+                "WS_AUDIO_BYTES_PER_SAMPLE": "2",
+            },
+            clear=True,
+        ):
+            settings = main.get_settings()
+
+        self.assertEqual(settings["ws_chunk_bytes"], 1280)
+        self.assertEqual(settings["ws_partial_min_bytes"], 1280)
+        self.assertEqual(settings["ws_partial_min_interval_ms"], 40)
+
     def test_run_transcription_with_lazy_conversion_skips_wav_for_explicit_whisper_language(self) -> None:
         from app import main
 
