@@ -24,8 +24,61 @@
 - `MMS_TORCH_DTYPE`：MMS 推理 dtype，默认 `float32`。
 - `MMS_VAD_FILTER`：默认 `true`。会在 MMS 前置裁掉前后静音，降低缅语重转写时的无效计算。
 - `PRELOAD_MODEL_ON_STARTUP`：设为 `true` 可减少首请求冷启动延迟（服务默认开启）。
-- `WS_PARTIAL_MIN_BYTES`：WebSocket 增量识别最小字节增量，默认 `131072`，避免每个小 chunk 都触发全量重识别。
-- `WS_PARTIAL_MIN_INTERVAL_MS`：WebSocket 增量识别最小触发间隔，默认 `1200` 毫秒，降低高频转码与解码开销。
+- `WS_CHUNK_MS`：WebSocket 音频 chunk 时长（毫秒），默认 `20`。
+- `WS_PARTIAL_MIN_BYTES`：WebSocket 增量识别最小字节增量；默认按 chunk 自动推导（16k/mono/16-bit/20ms 下为 `640`）。
+- `WS_PARTIAL_MIN_INTERVAL_MS`：WebSocket 增量识别最小触发间隔；默认与 `WS_CHUNK_MS` 一致（默认 `20` 毫秒）。
+
+### 低延迟实时架构（几十毫秒级）
+
+如果你要按下面目标跑实时流：
+
+- ASR：Paraformer（主）+ MMS（补充缅语）
+- 前端：WebRTC / App 实时流
+- VAD：Silero
+- 推理：`20ms chunk`、`batch=1`、Metal / NPU
+
+本项目当前已具备流式骨架（WebSocket + 增量转写 + VAD），并默认切到**20ms 粒度阈值**来触发 partial 解码节奏（`WS_CHUNK_MS=20`）：
+
+- 默认 `WS_PARTIAL_MIN_BYTES` 会按 16k / mono / 16-bit / 20ms 自动推导为 `640` 字节；
+- 默认 `WS_PARTIAL_MIN_INTERVAL_MS=20`；
+- 如需适配 App 侧 PCM 格式，可改：
+  - `WS_AUDIO_SAMPLE_RATE`
+  - `WS_AUDIO_CHANNELS`
+  - `WS_AUDIO_BYTES_PER_SAMPLE`
+
+> 说明：当前代码里的主模型仍是 Whisper 路径；MMS 已用于缅语补充路由。若你要把 Paraformer 作为主路径，可在现有 `TranscriberRouter` 上替换主分支。
+
+### WebSocket 真流式（降低首包响应时间）
+
+`/api/ws/transcribe` 现在支持 **PCM 直通流式模式**：
+
+- 当 `start` 消息里 `mime_type` 为 `audio/pcm` 或 `audio/L16` 时，服务不再对每次 partial 依赖 ffmpeg 容器转码；
+- 服务会直接把实时 PCM chunk 组装为短窗口 WAV 后立刻增量解码，明显降低“第一次有文本返回”的时间；
+- 容器音频（如 `audio/webm`）仍保持兼容，继续走原有转码路径。
+
+另外已增加 **Opus 实时解码链路**：
+
+- 客户端若上传 `audio/webm;codecs=opus` / `audio/ogg;codecs=opus`，服务端会先持续解码为 PCM；
+- partial/final ASR 直接消费解码后的 PCM 缓冲区，不再每次 partial 都做“容器文件落盘 + 再转码”。
+
+## 一键本地启动（Makefile）
+
+已新增 `Makefile`，可直接一键启动本地开发环境：
+
+```bash
+# 1) 安装全部依赖（Python + Web）
+make install
+
+# 2) 一键启动后端 + 前端（开发模式）
+make dev
+```
+
+常用命令：
+
+- `make dev-backend`：仅启动后端（uvicorn）
+- `make dev-web`：仅启动前端（Vite）
+- `make docker-up`：Docker Compose 一键启动
+- `make test`：运行测试
 
 另外，Whisper 和 MMS 模型实例都会在进程内单例缓存，不会在每次识别请求时重复初始化；慢通常来自首轮冷启动、ffmpeg 转码或过于高频的 WebSocket 增量全量重识别。首次使用缅语时还会发生 Hugging Face 模型下载，镜像和冷启动都会比原来更重。
 

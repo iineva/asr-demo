@@ -4,6 +4,8 @@ import logging
 import os
 import traceback
 import uuid
+import wave
+from contextlib import suppress
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import monotonic
@@ -137,6 +139,15 @@ async def run_transcription_with_lazy_conversion(
 
 
 def get_settings() -> Dict[str, Any]:
+    ws_chunk_ms = max(5, int(os.getenv("WS_CHUNK_MS", "20")))
+    ws_audio_sample_rate = max(8000, int(os.getenv("WS_AUDIO_SAMPLE_RATE", "16000")))
+    ws_audio_channels = max(1, int(os.getenv("WS_AUDIO_CHANNELS", "1")))
+    ws_audio_bytes_per_sample = max(1, int(os.getenv("WS_AUDIO_BYTES_PER_SAMPLE", "2")))
+    ws_chunk_bytes = max(
+        1,
+        int((ws_audio_sample_rate * ws_audio_channels * ws_audio_bytes_per_sample * ws_chunk_ms) / 1000),
+    )
+
     return {
         "service_name": os.getenv("SERVICE_NAME", "asr-service"),
         "upload_dir": os.getenv("UPLOAD_DIR", "uploads"),
@@ -150,9 +161,111 @@ def get_settings() -> Dict[str, Any]:
         ),
         "ws_partial_window_seconds": max(1, int(os.getenv("WS_PARTIAL_WINDOW_SECONDS", "20"))),
         "preload_model": os.getenv("PRELOAD_MODEL_ON_STARTUP", "true").lower() == "true",
-        "ws_partial_min_bytes": max(1, int(os.getenv("WS_PARTIAL_MIN_BYTES", "131072"))),
-        "ws_partial_min_interval_ms": max(0, int(os.getenv("WS_PARTIAL_MIN_INTERVAL_MS", "1200"))),
+        "ws_chunk_ms": ws_chunk_ms,
+        "ws_chunk_bytes": ws_chunk_bytes,
+        "ws_audio_sample_rate": ws_audio_sample_rate,
+        "ws_audio_channels": ws_audio_channels,
+        "ws_audio_bytes_per_sample": ws_audio_bytes_per_sample,
+        "ws_partial_min_bytes": max(1, int(os.getenv("WS_PARTIAL_MIN_BYTES", str(ws_chunk_bytes)))),
+        "ws_partial_min_interval_ms": max(0, int(os.getenv("WS_PARTIAL_MIN_INTERVAL_MS", str(ws_chunk_ms)))),
     }
+
+
+def is_pcm_stream(mime_type: str) -> bool:
+    normalized = (mime_type or "").lower()
+    return "pcm" in normalized or "audio/l16" in normalized
+
+
+def is_opus_stream(mime_type: str) -> bool:
+    normalized = (mime_type or "").lower()
+    return "opus" in normalized or "audio/webm" in normalized or "audio/ogg" in normalized
+
+
+def resolve_opus_container_format(mime_type: str) -> str:
+    normalized = (mime_type or "").lower()
+    if "audio/ogg" in normalized:
+        return "ogg"
+    return "webm"
+
+
+def write_pcm16le_wav(
+    *,
+    target_path: Path,
+    pcm_payload: bytes,
+    sample_rate: int,
+    channels: int,
+    bytes_per_sample: int,
+) -> None:
+    with wave.open(str(target_path), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(bytes_per_sample)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_payload)
+
+
+class OpusPcmStreamDecoder:
+    def __init__(self, *, mime_type: str, sample_rate: int, channels: int) -> None:
+        self.mime_type = mime_type
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self.reader_task: Optional[asyncio.Task[None]] = None
+        self._pcm_buffer = bytearray()
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        container_format = resolve_opus_container_format(self.mime_type)
+        self.process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-f",
+            container_format,
+            "-i",
+            "pipe:0",
+            "-ac",
+            str(self.channels),
+            "-ar",
+            str(self.sample_rate),
+            "-f",
+            "s16le",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self.reader_task = asyncio.create_task(self._read_stdout())
+
+    async def _read_stdout(self) -> None:
+        if self.process is None or self.process.stdout is None:
+            return
+        while True:
+            chunk = await self.process.stdout.read(4096)
+            if not chunk:
+                break
+            async with self._lock:
+                self._pcm_buffer.extend(chunk)
+
+    async def feed(self, payload: bytes) -> None:
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("opus decoder not started")
+        self.process.stdin.write(payload)
+        await self.process.stdin.drain()
+
+    async def snapshot_pcm(self) -> bytes:
+        async with self._lock:
+            return bytes(self._pcm_buffer)
+
+    async def close(self) -> None:
+        if self.process is None:
+            return
+        if self.process.stdin and not self.process.stdin.is_closing():
+            self.process.stdin.close()
+        with suppress(Exception):
+            if self.reader_task is not None:
+                await self.reader_task
+        with suppress(Exception):
+            await self.process.wait()
 
 
 @asynccontextmanager
@@ -411,6 +524,11 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
     received_bytes = 0
     last_partial_bytes = 0
     last_partial_at = 0.0
+    is_pcm_input = False
+    is_opus_input = False
+    pcm_buffer = bytearray()
+    partial_wav_path = None  # type: Optional[Path]
+    opus_decoder = None  # type: Optional[OpusPcmStreamDecoder]
 
     try:
         while True:
@@ -423,16 +541,33 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
             if "text" in message and message["text"] is not None:
                 payload = json.loads(message["text"])
                 if payload.get("type") == "start":
+                    if opus_decoder is not None:
+                        await opus_decoder.close()
+                        opus_decoder = None
                     requested_language = validate_language(payload.get("language", "auto"))
                     mime_type = payload.get("mime_type", "audio/webm")
                     session = StreamingTranscriptionSession(language=requested_language)
-                    source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
-                    source_path.touch(exist_ok=False)
+                    is_pcm_input = is_pcm_stream(mime_type)
+                    is_opus_input = is_opus_stream(mime_type) and not is_pcm_input
+                    pcm_buffer = bytearray()
+                    if is_pcm_input or is_opus_input:
+                        source_path = None
+                    else:
+                        source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
+                        source_path.touch(exist_ok=False)
+                    if is_opus_input:
+                        opus_decoder = OpusPcmStreamDecoder(
+                            mime_type=mime_type,
+                            sample_rate=settings["ws_audio_sample_rate"],
+                            channels=settings["ws_audio_channels"],
+                        )
+                        await opus_decoder.start()
                     LOGGER.info(
-                        "ws_transcribe step=session_started session_id=%s language=%s mime_type=%s",
+                        "ws_transcribe step=session_started session_id=%s language=%s mime_type=%s stream_mode=%s",
                         session.session_id,
                         requested_language,
                         mime_type,
+                        "pcm" if is_pcm_input else ("opus" if is_opus_input else "container"),
                     )
                     received_bytes = 0
                     last_partial_bytes = 0
@@ -447,25 +582,48 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                         )
                         break
 
-                    if source_path is None:
+                    if source_path is None and not is_pcm_input and not is_opus_input:
                         source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
                         source_path.touch(exist_ok=False)
                     if received_bytes <= 0:
                         await websocket.send_json(session.emit_error("audio stream is empty"))
                         break
                     convert_started_at = monotonic()
-                    LOGGER.info("ws_transcribe step=final_convert_start session_id=%s source=%s", session.session_id, source_path)
-                    wav_path = await convert_audio_to_wav(
-                        str(source_path),
-                        settings["output_dir"],
-                        settings["ffmpeg_timeout_seconds"],
-                    )
-                    LOGGER.info(
-                        "ws_transcribe step=final_convert_done session_id=%s elapsed_ms=%s wav=%s",
-                        session.session_id,
-                        int((monotonic() - convert_started_at) * 1000),
-                        wav_path,
-                    )
+                    if is_pcm_input or is_opus_input:
+                        if is_opus_input and opus_decoder is not None:
+                            await opus_decoder.close()
+                            pcm_buffer = bytearray(await opus_decoder.snapshot_pcm())
+                            opus_decoder = None
+                        if is_opus_input and not pcm_buffer:
+                            await websocket.send_json(session.emit_error("opus stream decode produced empty pcm"))
+                            break
+                        wav_path = Path(settings["output_dir"]) / f"{uuid.uuid4().hex}.wav"
+                        write_pcm16le_wav(
+                            target_path=wav_path,
+                            pcm_payload=bytes(pcm_buffer),
+                            sample_rate=settings["ws_audio_sample_rate"],
+                            channels=settings["ws_audio_channels"],
+                            bytes_per_sample=settings["ws_audio_bytes_per_sample"],
+                        )
+                        LOGGER.info(
+                            "ws_transcribe step=final_pcm_ready session_id=%s elapsed_ms=%s wav=%s",
+                            session.session_id,
+                            int((monotonic() - convert_started_at) * 1000),
+                            wav_path,
+                        )
+                    else:
+                        LOGGER.info("ws_transcribe step=final_convert_start session_id=%s source=%s", session.session_id, source_path)
+                        wav_path = await convert_audio_to_wav(
+                            str(source_path),
+                            settings["output_dir"],
+                            settings["ffmpeg_timeout_seconds"],
+                        )
+                        LOGGER.info(
+                            "ws_transcribe step=final_convert_done session_id=%s elapsed_ms=%s wav=%s",
+                            session.session_id,
+                            int((monotonic() - convert_started_at) * 1000),
+                            wav_path,
+                        )
                     decode_started_at = monotonic()
                     LOGGER.info("ws_transcribe step=final_decode_start session_id=%s", session.session_id)
                     result = await asyncio.wait_for(
@@ -518,10 +676,29 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                 if not chunk:
                     continue
                 if source_path is None:
-                    source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
-                    source_path.touch(exist_ok=False)
-
-                append_bytes(source_path, chunk)
+                    if is_pcm_input:
+                        pcm_buffer.extend(chunk)
+                    elif is_opus_input:
+                        if opus_decoder is None:
+                            await websocket.send_json(session.emit_error("opus decoder not initialized"))
+                            break
+                        await opus_decoder.feed(chunk)
+                        pcm_buffer = bytearray(await opus_decoder.snapshot_pcm())
+                    else:
+                        source_path = Path(settings["upload_dir"]) / f"{uuid.uuid4().hex}{mime_type_to_extension(mime_type)}"
+                        source_path.touch(exist_ok=False)
+                        append_bytes(source_path, chunk)
+                else:
+                    if is_pcm_input:
+                        pcm_buffer.extend(chunk)
+                    elif is_opus_input:
+                        if opus_decoder is None:
+                            await websocket.send_json(session.emit_error("opus decoder not initialized"))
+                            break
+                        await opus_decoder.feed(chunk)
+                        pcm_buffer = bytearray(await opus_decoder.snapshot_pcm())
+                    else:
+                        append_bytes(source_path, chunk)
                 received_bytes += len(chunk)
                 current_size = received_bytes
                 LOGGER.info(
@@ -545,12 +722,32 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
 
                 try:
                     partial_convert_started_at = monotonic()
-                    wav_path = await convert_audio_to_wav(
-                        str(source_path),
-                        settings["output_dir"],
-                        settings["ffmpeg_timeout_seconds"],
-                        tail_seconds=settings["ws_partial_window_seconds"],
-                    )
+                    if is_pcm_input or is_opus_input:
+                        if is_opus_input and opus_decoder is not None:
+                            pcm_buffer = bytearray(await opus_decoder.snapshot_pcm())
+                        bytes_per_second = (
+                            settings["ws_audio_sample_rate"]
+                            * settings["ws_audio_channels"]
+                            * settings["ws_audio_bytes_per_sample"]
+                        )
+                        tail_bytes = max(1, bytes_per_second * settings["ws_partial_window_seconds"])
+                        partial_payload = bytes(pcm_buffer[-tail_bytes:])
+                        partial_wav_path = Path(settings["output_dir"]) / f"{uuid.uuid4().hex}.wav"
+                        write_pcm16le_wav(
+                            target_path=partial_wav_path,
+                            pcm_payload=partial_payload,
+                            sample_rate=settings["ws_audio_sample_rate"],
+                            channels=settings["ws_audio_channels"],
+                            bytes_per_sample=settings["ws_audio_bytes_per_sample"],
+                        )
+                        wav_path = partial_wav_path
+                    else:
+                        wav_path = await convert_audio_to_wav(
+                            str(source_path),
+                            settings["output_dir"],
+                            settings["ffmpeg_timeout_seconds"],
+                            tail_seconds=settings["ws_partial_window_seconds"],
+                        )
                     partial_convert_elapsed_ms = int((monotonic() - partial_convert_started_at) * 1000)
                     partial_decode_started_at = monotonic()
                     result = await asyncio.wait_for(
@@ -584,6 +781,10 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
                     await websocket.send_json(
                         session.emit_progress("partial_segment", detail={"bytes_received": current_size})
                     )
+                finally:
+                    if partial_wav_path is not None:
+                        remove_file_safely(partial_wav_path)
+                        partial_wav_path = None
     except WebSocketDisconnect:
         return
     except ValueError as exc:
@@ -600,6 +801,10 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
         if session is not None:
             await websocket.send_json(session.emit_error(f"transcription failed: {exc}"))
     finally:
+        if opus_decoder is not None:
+            with suppress(Exception):
+                await opus_decoder.close()
+        remove_file_safely(partial_wav_path)
         remove_file_safely(wav_path)
         remove_file_safely(source_path)
         await websocket.close()
